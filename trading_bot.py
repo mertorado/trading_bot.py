@@ -23,6 +23,10 @@ MIN_1M_BAR_VOLUME_USDT = 15_000 # Kapanmış sinyal mumunda en az 15.000 USDT ha
 MIN_TRADES_PER_1M_CANDLE = 15   # Kapanmış sinyal mumunda en az 15 işlem olmalı
 MIN_PREVIOUS_BAR_VOLUME_RATIO = 1.0  # Önceki kapanmış mum, 20 mumluk ortalamanın en az bu katı olmalı
 
+# === TRAILING STOP AYARLARI ===
+TRAILING_ACTIVATION_PCT = 0.020   # %2 kârda trailing aktif olur
+TRAILING_STOP_PCT = 0.010         # %1 trailing mesafesi
+
 API_ENDPOINTS = [
     "https://data-api.binance.vision",
     "https://api1.binance.com",
@@ -192,13 +196,42 @@ class DualTradingBot:
                 else:
                     pnl_pct = (entry_price - current_price) / entry_price
 
-                # 1. Kâr Al
-                if pnl_pct >= TAKE_PROFIT_PCT:
-                    self.close_position(symbol, current_price, "KÂR AL (TP)")
-                # 2. Zarar Durdur
-                elif pnl_pct <= -STOP_LOSS_PCT:
-                    self.close_position(symbol, current_price, "ZARAR DURDUR (SL)")
-                # 3. Hareketsizlik / Zaman Aşımı (Day Trade Stopu)
+                # === TRAILING STOP MANTIĞI ===
+                if pnl_pct >= TRAILING_ACTIVATION_PCT and not pos['trailing_activated']:
+                    # Trailing stop aktif hale getir
+                    pos['trailing_activated'] = True
+                    if side == "LONG":
+                        pos['trailing_stop_price'] = current_price * (1 - TRAILING_STOP_PCT)
+                        pos['highest_price'] = current_price
+                    else:
+                        pos['trailing_stop_price'] = current_price * (1 + TRAILING_STOP_PCT)
+                        pos['lowest_price'] = current_price
+                    print(f"  [TRAILING AKTİF] {symbol} | Trailing Stop: ${pos['trailing_stop_price']:.4f}")
+
+                if pos['trailing_activated']:
+                    if side == "LONG":
+                        if current_price > pos['highest_price']:
+                            pos['highest_price'] = current_price
+                            pos['trailing_stop_price'] = current_price * (1 - TRAILING_STOP_PCT)
+                        if current_price <= pos['trailing_stop_price']:
+                            self.close_position(symbol, current_price, "TRAILING STOP")
+                            continue
+                    else:  # SHORT
+                        if current_price < pos['lowest_price']:
+                            pos['lowest_price'] = current_price
+                            pos['trailing_stop_price'] = current_price * (1 + TRAILING_STOP_PCT)
+                        if current_price >= pos['trailing_stop_price']:
+                            self.close_position(symbol, current_price, "TRAILING STOP")
+                            continue
+
+                # Normal TP / SL / Zaman Stopu (Trailing aktif değilse geçerli)
+                if not pos['trailing_activated']:
+                    if pnl_pct >= TAKE_PROFIT_PCT:
+                        self.close_position(symbol, current_price, "KÂR AL (TP)")
+                    elif pnl_pct <= -STOP_LOSS_PCT:
+                        self.close_position(symbol, current_price, "ZARAR DURDUR (SL)")
+                    elif elapsed_minutes >= MAX_HOLD_MINUTES:
+                        self.close_position(symbol, current_price, f"ZAMAN STOPU ({MAX_HOLD_MINUTES} dk doldu)")
                 elif elapsed_minutes >= MAX_HOLD_MINUTES:
                     self.close_position(symbol, current_price, f"ZAMAN STOPU ({MAX_HOLD_MINUTES} dk doldu)")
 
@@ -232,7 +265,12 @@ class DualTradingBot:
             'tp_price': tp_price,
             'sl_price': sl_price,
             'timestamp': time.time(),
-            'entry_time': datetime.now().strftime("%H:%M:%S")
+            'entry_time': datetime.now().strftime("%H:%M:%S"),
+            # === TRAILING STOP İÇİN YENİ ALANLAR ===
+            'trailing_activated': False,
+            'trailing_stop_price': None,
+            'highest_price': price if side == "LONG" else None,
+            'lowest_price': price if side == "SHORT" else None
         }
 
         icon = "🟢 LONG" if side == "LONG" else "🔴 SHORT"
