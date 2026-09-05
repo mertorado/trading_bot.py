@@ -3,8 +3,8 @@ import time
 import threading
 from datetime import datetime, timezone
 
-import requests
 import pandas as pd
+import requests
 from flask import Flask, jsonify, render_template_string
 
 
@@ -12,10 +12,10 @@ from flask import Flask, jsonify, render_template_string
 # AYARLAR
 # ============================================================
 
-MARKET_DATA_BASE_URL = "https://api.exchange.coinbase.com"
+MARKET_DATA_BASE_URL = (
+    "https://api.exchange.coinbase.com"
+)
 
-# Coinbase 3 dakikalık mum sunmadığı için aşağıdaki fonksiyon
-# 1 dakikalık mumları 3 dakikalık mumlara dönüştürür.
 TIMEFRAME = "3m"
 COINBASE_GRANULARITY_SECONDS = 60
 RESAMPLE_MINUTES = 3
@@ -26,34 +26,25 @@ INITIAL_BALANCE = 1000.0
 TRADE_SIZE_PERCENT = 0.10
 MAX_OPEN_POSITIONS = 10
 
-# İşlem hedefleri
 TAKE_PROFIT_PCT = 0.025
 STOP_LOSS_PCT = 0.015
 
-# Trailing stop
 TRAILING_TRIGGER_PCT = 0.012
 TRAILING_DISTANCE_PCT = 0.006
 
-# Paper trading komisyon simülasyonu
 COMMISSION_RATE = 0.001
 
-# İşlem sayısı sınırlamaları
-# Günlük zarar kesme yoktur.
 MAX_TRADES_PER_HOUR = 15
 MAX_TRADES_PER_DAY = 50
 
-# Aynı coin kapandıktan sonra tekrar açılmadan önce bekleme
 SYMBOL_COOLDOWN_SECONDS = 900
 
-# Coin filtreleri
 MIN_24H_VOLUME_USDT = 5_000_000
 VOLUME_SPIKE_FACTOR = 1.8
 
-# Fiyat filtresi
 MIN_PRICE = 0.05
 MAX_PRICE = 100.0
 
-# Taranacak maksimum sembol sayısı
 MAX_SYMBOLS_TO_SCAN = 40
 
 
@@ -90,11 +81,16 @@ def safe_float(value, default=0.0):
         return default
 
 
-def is_valid_product(product):
-    """
-    Coinbase ürün listesinden sadece USD spot paritelerini seçer.
-    """
+def candle_time_string(value):
+    try:
+        return pd.Timestamp(value).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        )
+    except Exception:
+        return utc_time_string()
 
+
+def is_valid_product(product):
     if not isinstance(product, dict):
         return False
 
@@ -123,21 +119,20 @@ def is_valid_product(product):
         "5S",
     }
 
-    base_currency_upper = base_currency.upper()
+    base_currency = base_currency.upper()
 
-    if base_currency_upper in forbidden_assets:
+    if base_currency in forbidden_assets:
         return False
 
-    for forbidden_asset in forbidden_assets:
-        if base_currency_upper.endswith(forbidden_asset):
+    for forbidden in forbidden_assets:
+        if base_currency.endswith(forbidden):
             return False
 
     return True
 
 
 def cleanup_old_trade_timestamps():
-    now = time.time()
-    one_day_ago = now - 86400
+    one_day_ago = time.time() - 86400
 
     with state_lock:
         trade_history_timestamps[:] = [
@@ -148,38 +143,27 @@ def cleanup_old_trade_timestamps():
 
 
 # ============================================================
-# PİYASA VERİSİ
+# COINBASE PİYASA VERİSİ
 # ============================================================
 
 def get_top_symbols():
     """
-    Coinbase public API'den USD paritelerini alır.
+    Coinbase USD paritelerini alır.
 
     Coinbase ticker verisindeki 24 saatlik base hacim,
-    güncel fiyatla çarpılarak yaklaşık USD hacmine çevrilir:
-
-        base_volume * current_price = yaklaşık USD hacmi
+    fiyatla çarpılarak yaklaşık USD hacmine çevrilir.
     """
 
-    products_url = (
-        f"{MARKET_DATA_BASE_URL}/products"
-    )
+    url = f"{MARKET_DATA_BASE_URL}/products"
 
     try:
-        products_response = requests.get(
-            products_url,
-            timeout=15
-        )
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
 
-        products_response.raise_for_status()
-
-        products = products_response.json()
+        products = response.json()
 
         if not isinstance(products, list):
-            print(
-                "[!] Coinbase ürün API'si liste döndürmedi:"
-            )
-            print(products)
+            print("[!] Coinbase ürün API'si liste döndürmedi")
             return []
 
         candidates = []
@@ -188,11 +172,11 @@ def get_top_symbols():
             if not is_valid_product(product):
                 continue
 
-            product_id = product.get("id")
+            symbol = product.get("id")
 
             ticker_url = (
                 f"{MARKET_DATA_BASE_URL}"
-                f"/products/{product_id}/ticker"
+                f"/products/{symbol}/ticker"
             )
 
             try:
@@ -200,40 +184,31 @@ def get_top_symbols():
                     ticker_url,
                     timeout=10
                 )
-
                 ticker_response.raise_for_status()
 
                 ticker = ticker_response.json()
 
-                last_price = safe_float(
+                price = safe_float(
                     ticker.get("price")
                 )
 
-                base_volume_24h = safe_float(
+                base_volume = safe_float(
                     ticker.get("volume")
                 )
 
-                if last_price <= 0:
+                if price <= 0 or base_volume <= 0:
                     continue
 
-                if base_volume_24h <= 0:
+                volume_usd = base_volume * price
+
+                if volume_usd < MIN_24H_VOLUME_USDT:
                     continue
 
-                quote_volume_24h = (
-                    base_volume_24h * last_price
-                )
-
-                if quote_volume_24h < MIN_24H_VOLUME_USDT:
-                    continue
-
-                if not MIN_PRICE <= last_price <= MAX_PRICE:
+                if not MIN_PRICE <= price <= MAX_PRICE:
                     continue
 
                 candidates.append(
-                    (
-                        product_id,
-                        quote_volume_24h
-                    )
+                    (symbol, volume_usd)
                 )
 
             except requests.exceptions.RequestException:
@@ -267,8 +242,7 @@ def get_top_symbols():
 
         try:
             print(
-                "[!] API cevabı: "
-                f"{products_response.text[:300]}"
+                f"[!] API cevabı: {response.text[:300]}"
             )
         except Exception:
             pass
@@ -277,36 +251,31 @@ def get_top_symbols():
 
     except requests.exceptions.RequestException as error:
         print(
-            "[!] Coinbase piyasa verisi bağlantı hatası: "
-            f"{error}"
+            f"[!] Coinbase bağlantı hatası: {error}"
         )
         return []
 
     except ValueError as error:
         print(
-            f"[!] Coinbase JSON cevabı okunamadı: {error}"
+            f"[!] Coinbase JSON hatası: {error}"
         )
         return []
 
     except Exception as error:
         print(
-            f"[!] Coinbase sembol listesi hatası: {error}"
+            f"[!] Sembol listesi hatası: {error}"
         )
         return []
 
 
 def get_klines_data(symbol):
     """
-    Coinbase'den 1 dakikalık mumları alır ve bunları
-    3 dakikalık mumlara dönüştürür.
+    Coinbase'den 1 dakikalık mumları alır ve 3 dakikalık
+    mumlara dönüştürür.
 
     Coinbase candle formatı:
 
-        [timestamp, low, high, open, close, volume]
-
-    Coinbase en fazla 300 candle döndürebildiği için
-    300 adet 1 dakikalık mum alınır. Bu, 80 adet 3 dakikalık
-    analiz mumu için yeterlidir.
+    [timestamp, low, high, open, close, volume]
     """
 
     url = (
@@ -315,7 +284,7 @@ def get_klines_data(symbol):
     )
 
     params = {
-        "granularity": COINBASE_GRANULARITY_SECONDS,
+        "granularity": COINBASE_GRANULARITY_SECONDS
     }
 
     try:
@@ -324,15 +293,11 @@ def get_klines_data(symbol):
             params=params,
             timeout=10
         )
-
         response.raise_for_status()
 
         data = response.json()
 
         if not isinstance(data, list):
-            return None
-
-        if len(data) < 180:
             return None
 
         rows = []
@@ -344,27 +309,14 @@ def get_klines_data(symbol):
             if len(candle) < 6:
                 continue
 
-            timestamp = safe_float(candle[0])
-            low = safe_float(candle[1])
-            high = safe_float(candle[2])
-            open_price = safe_float(candle[3])
-            close_price = safe_float(candle[4])
-            volume = safe_float(candle[5])
-
-            if timestamp <= 0:
-                continue
-
-            if open_price <= 0 or close_price <= 0:
-                continue
-
             rows.append(
                 {
-                    "timestamp": timestamp,
-                    "open": open_price,
-                    "high": high,
-                    "low": low,
-                    "close": close_price,
-                    "volume": volume,
+                    "timestamp": safe_float(candle[0]),
+                    "low": safe_float(candle[1]),
+                    "high": safe_float(candle[2]),
+                    "open": safe_float(candle[3]),
+                    "close": safe_float(candle[4]),
+                    "volume": safe_float(candle[5]),
                 }
             )
 
@@ -380,7 +332,7 @@ def get_klines_data(symbol):
         )
 
         dataframe = dataframe.sort_values(
-            by="datetime"
+            "datetime"
         )
 
         dataframe = dataframe.drop_duplicates(
@@ -389,7 +341,7 @@ def get_klines_data(symbol):
 
         dataframe = dataframe.set_index("datetime")
 
-        three_minute_data = dataframe.resample(
+        dataframe = dataframe.resample(
             "3min",
             label="left",
             closed="left"
@@ -403,64 +355,29 @@ def get_klines_data(symbol):
             }
         )
 
-        three_minute_data = (
-            three_minute_data
-            .dropna(
-                subset=[
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "volume",
-                ]
-            )
-            .reset_index()
-        )
+        dataframe = dataframe.dropna().reset_index()
 
-        if len(three_minute_data) < 65:
+        if len(dataframe) < 65:
             return None
 
-        three_minute_data["open_time"] = (
-            three_minute_data["datetime"]
-            .astype("int64")
+        dataframe["open_time"] = (
+            dataframe["datetime"].astype("int64")
             // 10**9
         )
 
-        three_minute_data["close_time"] = (
-            three_minute_data["open_time"]
-            + RESAMPLE_MINUTES * 60
+        dataframe["close_time"] = (
+            dataframe["open_time"] + 180
         )
 
-        three_minute_data["quote_volume"] = (
-            three_minute_data["close"]
-            * three_minute_data["volume"]
+        dataframe["quote_volume"] = (
+            dataframe["close"]
+            * dataframe["volume"]
         )
 
-        numeric_columns = [
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "quote_volume",
-        ]
-
-        for column in numeric_columns:
-            three_minute_data[column] = pd.to_numeric(
-                three_minute_data[column],
-                errors="coerce"
-            )
-
-        three_minute_data = (
-            three_minute_data
-            .dropna(subset=numeric_columns)
-            .reset_index(drop=True)
-        )
-
-        if len(three_minute_data) < 60:
+        if len(dataframe) < 60:
             return None
 
-        return three_minute_data
+        return dataframe
 
     except requests.exceptions.HTTPError as error:
         print(
@@ -472,13 +389,12 @@ def get_klines_data(symbol):
     except requests.exceptions.RequestException:
         return None
 
-    except ValueError:
+    except (ValueError, TypeError):
         return None
 
     except Exception as error:
         print(
-            f"[!] Coinbase mum verisi hatası "
-            f"{symbol}: {error}"
+            f"[!] Mum verisi hatası {symbol}: {error}"
         )
         return None
 
@@ -526,13 +442,8 @@ def calculate_indicators(dataframe):
         0
     )
 
-    average_gain = gains.rolling(
-        window=14
-    ).mean()
-
-    average_loss = losses.rolling(
-        window=14
-    ).mean()
+    average_gain = gains.rolling(14).mean()
+    average_loss = losses.rolling(14).mean()
 
     relative_strength = average_gain / (
         average_loss + 1e-9
@@ -543,27 +454,17 @@ def calculate_indicators(dataframe):
     )
 
     dataframe["volume_ma"] = dataframe["volume"].rolling(
-        window=20
+        20
     ).mean()
 
     return dataframe
 
 
 def analyze_signal(dataframe):
-    """
-    Son tamamlanmış 3 dakikalık mumu kullanır.
-
-    - Son satır halen oluşmakta olan mum olabilir.
-    - Bu nedenle -2 ve -3 kullanılır.
-    """
-
     if dataframe is None or len(dataframe) < 60:
         return None
 
     dataframe = calculate_indicators(dataframe)
-
-    if len(dataframe) < 60:
-        return None
 
     previous_candle = dataframe.iloc[-3]
     current_candle = dataframe.iloc[-2]
@@ -632,42 +533,32 @@ def can_open_new_trade(symbol):
         cooldown_until = symbol_cooldowns.get(symbol, 0)
 
         if now < cooldown_until:
-            remaining_seconds = int(
-                cooldown_until - now
-            )
-
             return (
                 False,
-                f"{symbol} soğuma süresinde "
-                f"({remaining_seconds} saniye)"
+                "Coin soğuma süresinde"
             )
 
         one_hour_ago = now - 3600
         one_day_ago = now - 86400
 
-        hourly_trades = [
-            timestamp
+        hourly_count = sum(
+            timestamp >= one_hour_ago
             for timestamp in trade_history_timestamps
-            if timestamp >= one_hour_ago
-        ]
+        )
 
-        daily_trades = [
-            timestamp
+        daily_count = sum(
+            timestamp >= one_day_ago
             for timestamp in trade_history_timestamps
-            if timestamp >= one_day_ago
-        ]
+        )
 
-        if len(hourly_trades) >= MAX_TRADES_PER_HOUR:
-            return False, "Saatlik işlem limitine ulaşıldı"
+        if hourly_count >= MAX_TRADES_PER_HOUR:
+            return False, "Saatlik işlem limiti"
 
-        if len(daily_trades) >= MAX_TRADES_PER_DAY:
-            return False, "Günlük işlem limitine ulaşıldı"
+        if daily_count >= MAX_TRADES_PER_DAY:
+            return False, "Günlük işlem limiti"
 
         if len(open_positions) >= MAX_OPEN_POSITIONS:
-            return (
-                False,
-                "Maksimum açık pozisyon sayısına ulaşıldı"
-            )
+            return False, "Açık pozisyon limiti"
 
         return True, "OK"
 
@@ -676,7 +567,12 @@ def can_open_new_trade(symbol):
 # POZİSYON AÇMA
 # ============================================================
 
-def execute_trade(symbol, side, price):
+def execute_trade(
+    symbol,
+    side,
+    price,
+    entry_candle_time
+):
     global balance
 
     with state_lock:
@@ -690,7 +586,7 @@ def execute_trade(symbol, side, price):
 
         if trade_amount < 10:
             print(
-                "[!] İşlem tutarı 10 USDT altında kaldı"
+                "[!] İşlem tutarı 10 USDT altında"
             )
             return False
 
@@ -722,6 +618,10 @@ def execute_trade(symbol, side, price):
 
         balance -= trade_amount + entry_fee
 
+        entry_time = candle_time_string(
+            entry_candle_time
+        )
+
         open_positions[symbol] = {
             "symbol": symbol,
             "side": side,
@@ -733,8 +633,14 @@ def execute_trade(symbol, side, price):
             "peak_price": price,
             "trailing_active": False,
             "open_time": utc_time_string(),
+            "entry_candle_time": entry_time,
             "last_price": price,
             "unrealized_pnl": 0.0,
+
+            "post_entry_high": price,
+            "post_entry_low": price,
+            "post_entry_high_time": entry_time,
+            "post_entry_low_time": entry_time,
         }
 
         trade_history_timestamps.append(
@@ -743,7 +649,8 @@ def execute_trade(symbol, side, price):
 
         print()
         print(
-            f"[POZİSYON AÇILDI] {side} {symbol}"
+            f"[POZİSYON AÇILDI] "
+            f"{side} {symbol}"
         )
         print(
             f"  Giriş fiyatı : ${price:.8f}"
@@ -835,13 +742,54 @@ def close_position(
     balance += net_return
 
     symbol_cooldowns[symbol] = (
-        time.time()
-        + SYMBOL_COOLDOWN_SECONDS
+        time.time() + SYMBOL_COOLDOWN_SECONDS
     )
 
     pnl_percent = (
         total_pnl / amount
     ) * 100
+
+    post_entry_high = position.get(
+        "post_entry_high",
+        entry_price
+    )
+
+    post_entry_low = position.get(
+        "post_entry_low",
+        entry_price
+    )
+
+    high_time = position.get(
+        "post_entry_high_time",
+        position.get("open_time", "")
+    )
+
+    low_time = position.get(
+        "post_entry_low_time",
+        position.get("open_time", "")
+    )
+
+    if side == "LONG":
+        max_favorable_move_pct = (
+            (post_entry_high - entry_price)
+            / entry_price
+        ) * 100
+
+        max_adverse_move_pct = (
+            (post_entry_low - entry_price)
+            / entry_price
+        ) * 100
+
+    else:
+        max_favorable_move_pct = (
+            (entry_price - post_entry_low)
+            / entry_price
+        ) * 100
+
+        max_adverse_move_pct = (
+            (entry_price - post_entry_high)
+            / entry_price
+        ) * 100
 
     trade_entry = {
         "symbol": symbol,
@@ -852,38 +800,81 @@ def close_position(
         "pnl": round(total_pnl, 4),
         "pnl_pct": round(pnl_percent, 4),
         "time": utc_time_string(),
+
+        "post_entry_high": round(
+            post_entry_high,
+            8
+        ),
+
+        "post_entry_low": round(
+            post_entry_low,
+            8
+        ),
+
+        "post_entry_high_time": high_time,
+        "post_entry_low_time": low_time,
+
+        "max_favorable_move_pct": round(
+            max_favorable_move_pct,
+            4
+        ),
+
+        "max_adverse_move_pct": round(
+            max_adverse_move_pct,
+            4
+        ),
     }
 
     trade_log.insert(0, trade_entry)
-
     del trade_log[100:]
 
-    result_text = (
-        "KAR"
-        if total_pnl >= 0
-        else "ZARAR"
-    )
+    result = "KAR" if total_pnl >= 0 else "ZARAR"
 
     print()
     print(
         f"[POZİSYON KAPATILDI] "
-        f"{result_text} {side} {symbol}"
+        f"{result} {side} {symbol}"
     )
     print(
-        f"  Sebep        : {exit_reason}"
+        f"  Sebep              : {exit_reason}"
     )
     print(
-        f"  Giriş/Çıkış  : "
+        f"  Giriş/Çıkış        : "
         f"${entry_price:.8f} -> "
         f"${exit_price:.8f}"
     )
     print(
-        f"  Net K/Z      : "
+        f"  Net K/Z            : "
         f"{total_pnl:+.4f} USDT "
         f"({pnl_percent:+.4f}%)"
     )
     print(
-        f"  Güncel bakiye: {balance:.4f} USDT"
+        f"  Güncel bakiye      : "
+        f"{balance:.4f} USDT"
+    )
+    print(
+        f"  İşlem sonrası tavan: "
+        f"${post_entry_high:.8f}"
+    )
+    print(
+        f"  Tavan zamanı       : "
+        f"{high_time}"
+    )
+    print(
+        f"  İşlem sonrası taban: "
+        f"${post_entry_low:.8f}"
+    )
+    print(
+        f"  Taban zamanı       : "
+        f"{low_time}"
+    )
+    print(
+        f"  Maks. olumlu hareket: "
+        f"{max_favorable_move_pct:+.4f}%"
+    )
+    print(
+        f"  Maks. ters hareket : "
+        f"{max_adverse_move_pct:+.4f}%"
     )
     print()
 
@@ -898,7 +889,6 @@ def manage_positions():
         if dataframe is None or len(dataframe) < 2:
             continue
 
-        # Son tamamlanmış 3 dakikalık mum
         completed_candle = dataframe.iloc[-2]
 
         current_price = safe_float(
@@ -912,6 +902,8 @@ def manage_positions():
         candle_low = safe_float(
             completed_candle["low"]
         )
+
+        candle_time = completed_candle["datetime"]
 
         if current_price <= 0:
             continue
@@ -934,6 +926,45 @@ def manage_positions():
                 ),
                 4
             )
+
+            entry_time = position.get(
+                "entry_candle_time"
+            )
+
+            try:
+                update_extremes = (
+                    pd.Timestamp(candle_time)
+                    > pd.Timestamp(entry_time)
+                )
+            except Exception:
+                update_extremes = True
+
+            if update_extremes:
+                if candle_high > position[
+                    "post_entry_high"
+                ]:
+                    position[
+                        "post_entry_high"
+                    ] = candle_high
+
+                    position[
+                        "post_entry_high_time"
+                    ] = candle_time_string(
+                        candle_time
+                    )
+
+                if candle_low < position[
+                    "post_entry_low"
+                ]:
+                    position[
+                        "post_entry_low"
+                    ] = candle_low
+
+                    position[
+                        "post_entry_low_time"
+                    ] = candle_time_string(
+                        candle_time
+                    )
 
             exit_reason = None
             exit_price = current_price
@@ -1020,7 +1051,7 @@ def manage_positions():
 
 
 # ============================================================
-# WEB DASHBOARD
+# DASHBOARD
 # ============================================================
 
 DASHBOARD_HTML = """
@@ -1050,15 +1081,15 @@ DASHBOARD_HTML = """
         }
 
         h1 {
-            margin: 0 0 8px 0;
             color: #f9fafb;
             font-size: 26px;
+            margin: 0 0 8px;
         }
 
         h2 {
-            margin-top: 32px;
             color: #60a5fa;
             font-size: 20px;
+            margin-top: 32px;
         }
 
         .subtitle {
@@ -1075,14 +1106,14 @@ DASHBOARD_HTML = """
         }
 
         .summary-item {
-            border: 1px solid #29313d;
             background: #171b22;
+            border: 1px solid #29313d;
             padding: 16px;
         }
 
         .summary-label {
-            display: block;
             color: #9ca3af;
+            display: block;
             font-size: 12px;
             margin-bottom: 8px;
             text-transform: uppercase;
@@ -1095,22 +1126,22 @@ DASHBOARD_HTML = """
         }
 
         .table-wrapper {
-            width: 100%;
-            overflow-x: auto;
             border: 1px solid #29313d;
+            overflow-x: auto;
+            width: 100%;
         }
 
         table {
-            width: 100%;
-            min-width: 900px;
-            border-collapse: collapse;
             background: #171b22;
+            border-collapse: collapse;
+            min-width: 1250px;
+            width: 100%;
         }
 
         th,
         td {
-            padding: 12px;
             border-bottom: 1px solid #29313d;
+            padding: 11px;
             text-align: left;
             white-space: nowrap;
         }
@@ -1126,35 +1157,35 @@ DASHBOARD_HTML = """
             font-size: 13px;
         }
 
-        .long {
-            color: #4ade80;
-            font-weight: bold;
-        }
-
-        .short {
-            color: #f87171;
-            font-weight: bold;
-        }
-
+        .long,
         .profit {
             color: #4ade80;
+            font-weight: bold;
         }
 
+        .short,
         .loss {
             color: #f87171;
+            font-weight: bold;
         }
 
         .empty {
-            border: 1px solid #29313d;
             background: #171b22;
-            padding: 18px;
+            border: 1px solid #29313d;
             color: #9ca3af;
+            padding: 18px;
         }
 
         .footer {
-            margin-top: 28px;
             color: #6b7280;
             font-size: 12px;
+            margin-top: 28px;
+        }
+
+        .small {
+            color: #9ca3af;
+            font-size: 11px;
+            line-height: 1.5;
         }
     </style>
 </head>
@@ -1225,7 +1256,8 @@ DASHBOARD_HTML = """
                     <th>SL</th>
                     <th>Trailing</th>
                     <th>Anlık K/Z</th>
-                    <th>Açılış</th>
+                    <th>İşlem sonrası tavan</th>
+                    <th>İşlem sonrası taban</th>
                 </tr>
             </thead>
 
@@ -1281,14 +1313,29 @@ DASHBOARD_HTML = """
                     </td>
 
                     <td>
-                        {{ position['open_time'] }}
+                        ${{ "%.8f"|format(
+                            position['post_entry_high']
+                        ) }}
+
+                        <div class="small">
+                            {{ position['post_entry_high_time'] }}
+                        </div>
+                    </td>
+
+                    <td>
+                        ${{ "%.8f"|format(
+                            position['post_entry_low']
+                        ) }}
+
+                        <div class="small">
+                            {{ position['post_entry_low_time'] }}
+                        </div>
                     </td>
                 </tr>
                 {% endfor %}
             </tbody>
         </table>
     </div>
-
     {% else %}
         <div class="empty">
             Şu anda açık pozisyon yok.
@@ -1310,6 +1357,12 @@ DASHBOARD_HTML = """
                     <th>Çıkış</th>
                     <th>Net K/Z</th>
                     <th>Yüzde</th>
+                    <th>Tavan</th>
+                    <th>Tavan zamanı</th>
+                    <th>Taban</th>
+                    <th>Taban zamanı</th>
+                    <th>Maks. olumlu</th>
+                    <th>Maks. ters</th>
                 </tr>
             </thead>
 
@@ -1344,12 +1397,41 @@ DASHBOARD_HTML = """
                            else 'loss' }}">
                         {{ trade['pnl_pct'] }}%
                     </td>
+
+                    <td>
+                        ${{ trade['post_entry_high'] }}
+                    </td>
+
+                    <td>
+                        {{ trade['post_entry_high_time'] }}
+                    </td>
+
+                    <td>
+                        ${{ trade['post_entry_low'] }}
+                    </td>
+
+                    <td>
+                        {{ trade['post_entry_low_time'] }}
+                    </td>
+
+                    <td class="
+                        {{ 'profit'
+                           if trade['max_favorable_move_pct'] >= 0
+                           else 'loss' }}">
+                        {{ trade['max_favorable_move_pct'] }}%
+                    </td>
+
+                    <td class="
+                        {{ 'profit'
+                           if trade['max_adverse_move_pct'] >= 0
+                           else 'loss' }}">
+                        {{ trade['max_adverse_move_pct'] }}%
+                    </td>
                 </tr>
                 {% endfor %}
             </tbody>
         </table>
     </div>
-
     {% else %}
         <div class="empty">
             Henüz kapanmış işlem yok.
@@ -1448,9 +1530,7 @@ def run_bot():
         f"Başlangıç bakiye   : "
         f"{INITIAL_BALANCE:.2f} USDT"
     )
-    print(
-        "Günlük zarar kesme : YOK"
-    )
+    print("Günlük zarar kesme : YOK")
     print("=" * 60)
 
     while True:
@@ -1487,9 +1567,10 @@ def run_bot():
                     if signal is None:
                         continue
 
-                    # Sinyal son tamamlanmış mumdan alınır
+                    signal_candle = dataframe.iloc[-2]
+
                     signal_price = safe_float(
-                        dataframe.iloc[-2]["close"]
+                        signal_candle["close"]
                     )
 
                     if signal_price <= 0:
@@ -1498,7 +1579,8 @@ def run_bot():
                     opened = execute_trade(
                         symbol,
                         signal,
-                        signal_price
+                        signal_price,
+                        signal_candle["datetime"]
                     )
 
                     if opened:
