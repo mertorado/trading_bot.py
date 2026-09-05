@@ -12,9 +12,14 @@ from flask import Flask, jsonify, render_template_string
 # AYARLAR
 # ============================================================
 
-MARKET_DATA_BASE_URL = "https://api.binance.com"
+MARKET_DATA_BASE_URL = "https://api.exchange.coinbase.com"
 
+# Coinbase 3 dakikalık mum sunmadığı için aşağıdaki fonksiyon
+# 1 dakikalık mumları 3 dakikalık mumlara dönüştürür.
 TIMEFRAME = "3m"
+COINBASE_GRANULARITY_SECONDS = 60
+RESAMPLE_MINUTES = 3
+
 SCAN_INTERVAL_SECONDS = 20
 
 INITIAL_BALANCE = 1000.0
@@ -44,11 +49,11 @@ SYMBOL_COOLDOWN_SECONDS = 900
 MIN_24H_VOLUME_USDT = 5_000_000
 VOLUME_SPIKE_FACTOR = 1.8
 
-# Çok düşük veya aşırı pahalı coinleri filtrele
+# Fiyat filtresi
 MIN_PRICE = 0.05
 MAX_PRICE = 100.0
 
-# Binance API isteklerinde kullanılacak sembol sayısı
+# Taranacak maksimum sembol sayısı
 MAX_SYMBOLS_TO_SCAN = 40
 
 
@@ -73,7 +78,9 @@ app = Flask(__name__)
 # ============================================================
 
 def utc_time_string():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return datetime.now(timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
 
 
 def safe_float(value, default=0.0):
@@ -83,22 +90,47 @@ def safe_float(value, default=0.0):
         return default
 
 
-def is_valid_symbol(symbol):
-    if not isinstance(symbol, str):
+def is_valid_product(product):
+    """
+    Coinbase ürün listesinden sadece USD spot paritelerini seçer.
+    """
+
+    if not isinstance(product, dict):
         return False
 
-    forbidden_words = [
+    product_id = product.get("id", "")
+    base_currency = product.get("base_currency", "")
+    quote_currency = product.get("quote_currency", "")
+    status = product.get("status", "")
+
+    if not product_id or not base_currency:
+        return False
+
+    if quote_currency != "USD":
+        return False
+
+    if status not in ("online", "active"):
+        return False
+
+    forbidden_assets = {
         "UP",
         "DOWN",
         "BEAR",
         "BULL",
-    ]
+        "3L",
+        "3S",
+        "5L",
+        "5S",
+    }
 
-    if not symbol.endswith("USDT"):
+    base_currency_upper = base_currency.upper()
+
+    if base_currency_upper in forbidden_assets:
         return False
 
-    if any(word in symbol for word in forbidden_words):
-        return False
+    for forbidden_asset in forbidden_assets:
+        if base_currency_upper.endswith(forbidden_asset):
+            return False
 
     return True
 
@@ -121,120 +153,288 @@ def cleanup_old_trade_timestamps():
 
 def get_top_symbols():
     """
-    Binance public API'den yüksek 24 saatlik hacme sahip
-    USDT paritelerini getirir.
+    Coinbase public API'den USD paritelerini alır.
 
-    Bu fonksiyon Binance hesabı veya API key kullanmaz.
+    Coinbase ticker verisindeki 24 saatlik base hacim,
+    güncel fiyatla çarpılarak yaklaşık USD hacmine çevrilir:
+
+        base_volume * current_price = yaklaşık USD hacmi
     """
 
-    url = f"{MARKET_DATA_BASE_URL}/api/v3/ticker/24hr"
+    products_url = (
+        f"{MARKET_DATA_BASE_URL}/products"
+    )
 
     try:
-        response = requests.get(url, timeout=15)
-        response.raise_for_status()
+        products_response = requests.get(
+            products_url,
+            timeout=15
+        )
 
-        data = response.json()
+        products_response.raise_for_status()
 
-        if not isinstance(data, list):
-            print(f"[!] Sembol API'si liste döndürmedi: {data}")
+        products = products_response.json()
+
+        if not isinstance(products, list):
+            print(
+                "[!] Coinbase ürün API'si liste döndürmedi:"
+            )
+            print(products)
             return []
 
-        valid_symbols = []
+        candidates = []
 
-        for item in data:
-            if not isinstance(item, dict):
+        for product in products:
+            if not is_valid_product(product):
                 continue
 
-            symbol = item.get("symbol", "")
+            product_id = product.get("id")
 
-            if not is_valid_symbol(symbol):
+            ticker_url = (
+                f"{MARKET_DATA_BASE_URL}"
+                f"/products/{product_id}/ticker"
+            )
+
+            try:
+                ticker_response = requests.get(
+                    ticker_url,
+                    timeout=10
+                )
+
+                ticker_response.raise_for_status()
+
+                ticker = ticker_response.json()
+
+                last_price = safe_float(
+                    ticker.get("price")
+                )
+
+                base_volume_24h = safe_float(
+                    ticker.get("volume")
+                )
+
+                if last_price <= 0:
+                    continue
+
+                if base_volume_24h <= 0:
+                    continue
+
+                quote_volume_24h = (
+                    base_volume_24h * last_price
+                )
+
+                if quote_volume_24h < MIN_24H_VOLUME_USDT:
+                    continue
+
+                if not MIN_PRICE <= last_price <= MAX_PRICE:
+                    continue
+
+                candidates.append(
+                    (
+                        product_id,
+                        quote_volume_24h
+                    )
+                )
+
+            except requests.exceptions.RequestException:
                 continue
 
-            quote_volume = safe_float(item.get("quoteVolume"))
-            last_price = safe_float(item.get("lastPrice"))
-
-            if quote_volume < MIN_24H_VOLUME_USDT:
+            except (TypeError, ValueError):
                 continue
 
-            if not MIN_PRICE <= last_price <= MAX_PRICE:
-                continue
-
-            valid_symbols.append((symbol, quote_volume))
-
-        valid_symbols.sort(
+        candidates.sort(
             key=lambda item: item[1],
             reverse=True
         )
 
         symbols = [
             symbol
-            for symbol, volume in valid_symbols[:MAX_SYMBOLS_TO_SCAN]
+            for symbol, volume in candidates[
+                :MAX_SYMBOLS_TO_SCAN
+            ]
         ]
 
-        print(f"[+] {len(symbols)} aday sembol bulundu")
+        print(
+            f"[+] {len(symbols)} Coinbase aday sembol bulundu"
+        )
 
         return symbols
 
     except requests.exceptions.HTTPError as error:
-        print(f"[!] Binance HTTP hatası: {error}")
+        print(
+            f"[!] Coinbase ürün API HTTP hatası: {error}"
+        )
 
         try:
-            print(f"[!] API cevabı: {response.text[:300]}")
+            print(
+                "[!] API cevabı: "
+                f"{products_response.text[:300]}"
+            )
         except Exception:
             pass
 
         return []
 
     except requests.exceptions.RequestException as error:
-        print(f"[!] Piyasa verisi bağlantı hatası: {error}")
+        print(
+            "[!] Coinbase piyasa verisi bağlantı hatası: "
+            f"{error}"
+        )
         return []
 
     except ValueError as error:
-        print(f"[!] API JSON cevabı okunamadı: {error}")
+        print(
+            f"[!] Coinbase JSON cevabı okunamadı: {error}"
+        )
         return []
 
     except Exception as error:
-        print(f"[!] Sembol listesi hatası: {error}")
+        print(
+            f"[!] Coinbase sembol listesi hatası: {error}"
+        )
         return []
 
 
 def get_klines_data(symbol):
     """
-    Son 80 adet 3 dakikalık mumu getirir.
+    Coinbase'den 1 dakikalık mumları alır ve bunları
+    3 dakikalık mumlara dönüştürür.
+
+    Coinbase candle formatı:
+
+        [timestamp, low, high, open, close, volume]
+
+    Coinbase en fazla 300 candle döndürebildiği için
+    300 adet 1 dakikalık mum alınır. Bu, 80 adet 3 dakikalık
+    analiz mumu için yeterlidir.
     """
 
     url = (
-        f"{MARKET_DATA_BASE_URL}/api/v3/klines"
-        f"?symbol={symbol}"
-        f"&interval={TIMEFRAME}"
-        f"&limit=80"
+        f"{MARKET_DATA_BASE_URL}"
+        f"/products/{symbol}/candles"
     )
 
+    params = {
+        "granularity": COINBASE_GRANULARITY_SECONDS,
+    }
+
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.get(
+            url,
+            params=params,
+            timeout=10
+        )
+
         response.raise_for_status()
 
         data = response.json()
 
-        if not isinstance(data, list) or len(data) < 60:
+        if not isinstance(data, list):
             return None
 
-        columns = [
-            "open_time",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "close_time",
-            "quote_volume",
-            "number_of_trades",
-            "taker_buy_base_volume",
-            "taker_buy_quote_volume",
-            "ignore",
-        ]
+        if len(data) < 180:
+            return None
 
-        dataframe = pd.DataFrame(data, columns=columns)
+        rows = []
+
+        for candle in data:
+            if not isinstance(candle, list):
+                continue
+
+            if len(candle) < 6:
+                continue
+
+            timestamp = safe_float(candle[0])
+            low = safe_float(candle[1])
+            high = safe_float(candle[2])
+            open_price = safe_float(candle[3])
+            close_price = safe_float(candle[4])
+            volume = safe_float(candle[5])
+
+            if timestamp <= 0:
+                continue
+
+            if open_price <= 0 or close_price <= 0:
+                continue
+
+            rows.append(
+                {
+                    "timestamp": timestamp,
+                    "open": open_price,
+                    "high": high,
+                    "low": low,
+                    "close": close_price,
+                    "volume": volume,
+                }
+            )
+
+        if len(rows) < 180:
+            return None
+
+        dataframe = pd.DataFrame(rows)
+
+        dataframe["datetime"] = pd.to_datetime(
+            dataframe["timestamp"],
+            unit="s",
+            utc=True
+        )
+
+        dataframe = dataframe.sort_values(
+            by="datetime"
+        )
+
+        dataframe = dataframe.drop_duplicates(
+            subset=["datetime"]
+        )
+
+        dataframe = dataframe.set_index("datetime")
+
+        three_minute_data = dataframe.resample(
+            "3min",
+            label="left",
+            closed="left"
+        ).agg(
+            {
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+            }
+        )
+
+        three_minute_data = (
+            three_minute_data
+            .dropna(
+                subset=[
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                ]
+            )
+            .reset_index()
+        )
+
+        if len(three_minute_data) < 65:
+            return None
+
+        three_minute_data["open_time"] = (
+            three_minute_data["datetime"]
+            .astype("int64")
+            // 10**9
+        )
+
+        three_minute_data["close_time"] = (
+            three_minute_data["open_time"]
+            + RESAMPLE_MINUTES * 60
+        )
+
+        three_minute_data["quote_volume"] = (
+            three_minute_data["close"]
+            * three_minute_data["volume"]
+        )
 
         numeric_columns = [
             "open",
@@ -246,19 +446,28 @@ def get_klines_data(symbol):
         ]
 
         for column in numeric_columns:
-            dataframe[column] = pd.to_numeric(
-                dataframe[column],
+            three_minute_data[column] = pd.to_numeric(
+                three_minute_data[column],
                 errors="coerce"
             )
 
-        dataframe = dataframe.dropna(
-            subset=numeric_columns
-        ).reset_index(drop=True)
+        three_minute_data = (
+            three_minute_data
+            .dropna(subset=numeric_columns)
+            .reset_index(drop=True)
+        )
 
-        if len(dataframe) < 60:
+        if len(three_minute_data) < 60:
             return None
 
-        return dataframe
+        return three_minute_data
+
+    except requests.exceptions.HTTPError as error:
+        print(
+            f"[!] Coinbase mum HTTP hatası "
+            f"{symbol}: {error}"
+        )
+        return None
 
     except requests.exceptions.RequestException:
         return None
@@ -266,7 +475,11 @@ def get_klines_data(symbol):
     except ValueError:
         return None
 
-    except Exception:
+    except Exception as error:
+        print(
+            f"[!] Coinbase mum verisi hatası "
+            f"{symbol}: {error}"
+        )
         return None
 
 
@@ -338,10 +551,10 @@ def calculate_indicators(dataframe):
 
 def analyze_signal(dataframe):
     """
-    Son tamamlanmış mumu kullanır.
+    Son tamamlanmış 3 dakikalık mumu kullanır.
 
-    - Son satır genellikle halen oluşan mum olabilir.
-    - Bu nedenle sinyal için -2 ve -3 kullanılır.
+    - Son satır halen oluşmakta olan mum olabilir.
+    - Bu nedenle -2 ve -3 kullanılır.
     """
 
     if dataframe is None or len(dataframe) < 60:
@@ -373,7 +586,8 @@ def analyze_signal(dataframe):
 
     volume_is_strong = (
         current_candle["volume"]
-        >= current_candle["volume_ma"] * VOLUME_SPIKE_FACTOR
+        >= current_candle["volume_ma"]
+        * VOLUME_SPIKE_FACTOR
     )
 
     long_signal = (
@@ -418,7 +632,9 @@ def can_open_new_trade(symbol):
         cooldown_until = symbol_cooldowns.get(symbol, 0)
 
         if now < cooldown_until:
-            remaining_seconds = int(cooldown_until - now)
+            remaining_seconds = int(
+                cooldown_until - now
+            )
 
             return (
                 False,
@@ -448,7 +664,10 @@ def can_open_new_trade(symbol):
             return False, "Günlük işlem limitine ulaşıldı"
 
         if len(open_positions) >= MAX_OPEN_POSITIONS:
-            return False, "Maksimum açık pozisyon sayısına ulaşıldı"
+            return (
+                False,
+                "Maksimum açık pozisyon sayısına ulaşıldı"
+            )
 
         return True, "OK"
 
@@ -470,21 +689,36 @@ def execute_trade(symbol, side, price):
         trade_amount = balance * TRADE_SIZE_PERCENT
 
         if trade_amount < 10:
-            print("[!] İşlem tutarı 10 USDT altında kaldı")
+            print(
+                "[!] İşlem tutarı 10 USDT altında kaldı"
+            )
             return False
 
         entry_fee = trade_amount * COMMISSION_RATE
 
         if balance < trade_amount + entry_fee:
-            print("[!] Yeterli paper trading bakiyesi yok")
+            print(
+                "[!] Yeterli paper trading bakiyesi yok"
+            )
             return False
 
         if side == "LONG":
-            take_profit = price * (1 + TAKE_PROFIT_PCT)
-            stop_loss = price * (1 - STOP_LOSS_PCT)
+            take_profit = price * (
+                1 + TAKE_PROFIT_PCT
+            )
+
+            stop_loss = price * (
+                1 - STOP_LOSS_PCT
+            )
+
         else:
-            take_profit = price * (1 - TAKE_PROFIT_PCT)
-            stop_loss = price * (1 + STOP_LOSS_PCT)
+            take_profit = price * (
+                1 - TAKE_PROFIT_PCT
+            )
+
+            stop_loss = price * (
+                1 + STOP_LOSS_PCT
+            )
 
         balance -= trade_amount + entry_fee
 
@@ -503,17 +737,29 @@ def execute_trade(symbol, side, price):
             "unrealized_pnl": 0.0,
         }
 
-        trade_history_timestamps.append(time.time())
-
-        icon = "LONG" if side == "LONG" else "SHORT"
+        trade_history_timestamps.append(
+            time.time()
+        )
 
         print()
-        print(f"[POZİSYON AÇILDI] {icon} {symbol}")
-        print(f"  Giriş fiyatı : ${price:.8f}")
-        print(f"  İşlem tutarı : {trade_amount:.2f} USDT")
-        print(f"  TP           : ${take_profit:.8f}")
-        print(f"  SL           : ${stop_loss:.8f}")
-        print(f"  Kalan bakiye : {balance:.2f} USDT")
+        print(
+            f"[POZİSYON AÇILDI] {side} {symbol}"
+        )
+        print(
+            f"  Giriş fiyatı : ${price:.8f}"
+        )
+        print(
+            f"  İşlem tutarı : {trade_amount:.2f} USDT"
+        )
+        print(
+            f"  TP           : ${take_profit:.8f}"
+        )
+        print(
+            f"  SL           : ${stop_loss:.8f}"
+        )
+        print(
+            f"  Kalan bakiye : {balance:.2f} USDT"
+        )
         print()
 
         return True
@@ -532,12 +778,17 @@ def calculate_unrealized_pnl(position, current_price):
         gross_value = amount * (
             current_price / entry_price
         )
+
     else:
         gross_value = amount * (
-            1 + (entry_price - current_price) / entry_price
+            1 + (
+                entry_price - current_price
+            ) / entry_price
         )
 
-    estimated_exit_fee = gross_value * COMMISSION_RATE
+    estimated_exit_fee = (
+        gross_value * COMMISSION_RATE
+    )
 
     return (
         gross_value
@@ -547,7 +798,12 @@ def calculate_unrealized_pnl(position, current_price):
     )
 
 
-def close_position(symbol, position, exit_price, exit_reason):
+def close_position(
+    symbol,
+    position,
+    exit_price,
+    exit_reason
+):
     global balance
 
     entry_price = position["entry_price"]
@@ -559,20 +815,28 @@ def close_position(symbol, position, exit_price, exit_reason):
         gross_return = amount * (
             exit_price / entry_price
         )
+
     else:
         gross_return = amount * (
-            1 + (entry_price - exit_price) / entry_price
+            1 + (
+                entry_price - exit_price
+            ) / entry_price
         )
 
     exit_fee = gross_return * COMMISSION_RATE
     net_return = gross_return - exit_fee
 
-    total_pnl = net_return - amount - entry_fee
+    total_pnl = (
+        net_return
+        - amount
+        - entry_fee
+    )
 
     balance += net_return
 
     symbol_cooldowns[symbol] = (
-        time.time() + SYMBOL_COOLDOWN_SECONDS
+        time.time()
+        + SYMBOL_COOLDOWN_SECONDS
     )
 
     pnl_percent = (
@@ -594,24 +858,33 @@ def close_position(symbol, position, exit_price, exit_reason):
 
     del trade_log[100:]
 
-    result_icon = "KAR" if total_pnl >= 0 else "ZARAR"
+    result_text = (
+        "KAR"
+        if total_pnl >= 0
+        else "ZARAR"
+    )
 
     print()
     print(
         f"[POZİSYON KAPATILDI] "
-        f"{result_icon} {side} {symbol}"
-    )
-    print(f"  Sebep        : {exit_reason}")
-    print(
-        f"  Giriş/Çıkış   : "
-        f"${entry_price:.8f} -> ${exit_price:.8f}"
+        f"{result_text} {side} {symbol}"
     )
     print(
-        f"  Net K/Z       : "
+        f"  Sebep        : {exit_reason}"
+    )
+    print(
+        f"  Giriş/Çıkış  : "
+        f"${entry_price:.8f} -> "
+        f"${exit_price:.8f}"
+    )
+    print(
+        f"  Net K/Z      : "
         f"{total_pnl:+.4f} USDT "
         f"({pnl_percent:+.4f}%)"
     )
-    print(f"  Güncel bakiye : {balance:.4f} USDT")
+    print(
+        f"  Güncel bakiye: {balance:.4f} USDT"
+    )
     print()
 
 
@@ -625,7 +898,7 @@ def manage_positions():
         if dataframe is None or len(dataframe) < 2:
             continue
 
-        # Son tamamlanmış mum
+        # Son tamamlanmış 3 dakikalık mum
         completed_candle = dataframe.iloc[-2]
 
         current_price = safe_float(
@@ -640,6 +913,9 @@ def manage_positions():
             completed_candle["low"]
         )
 
+        if current_price <= 0:
+            continue
+
         with state_lock:
             if symbol not in open_positions:
                 continue
@@ -650,6 +926,7 @@ def manage_positions():
             entry_price = position["entry_price"]
 
             position["last_price"] = current_price
+
             position["unrealized_pnl"] = round(
                 calculate_unrealized_pnl(
                     position,
@@ -672,7 +949,10 @@ def manage_positions():
                     - entry_price
                 ) / entry_price
 
-                if profit_from_entry >= TRAILING_TRIGGER_PCT:
+                if (
+                    profit_from_entry
+                    >= TRAILING_TRIGGER_PCT
+                ):
                     position["trailing_active"] = True
 
                 if position["trailing_active"]:
@@ -704,7 +984,10 @@ def manage_positions():
                     - position["peak_price"]
                 ) / entry_price
 
-                if profit_from_entry >= TRAILING_TRIGGER_PCT:
+                if (
+                    profit_from_entry
+                    >= TRAILING_TRIGGER_PCT
+                ):
                     position["trailing_active"] = True
 
                 if position["trailing_active"]:
@@ -745,6 +1028,7 @@ DASHBOARD_HTML = """
 <html lang="tr">
 <head>
     <meta charset="UTF-8">
+
     <meta name="viewport"
           content="width=device-width, initial-scale=1.0">
 
@@ -879,34 +1163,46 @@ DASHBOARD_HTML = """
     <h1>Paper Trading Dashboard</h1>
 
     <div class="subtitle">
-        Veri kaynağı: Binance public market data |
+        Veri kaynağı: Coinbase public market data |
         İşlemler sanal
     </div>
 
     <section class="summary">
         <div class="summary-item">
-            <span class="summary-label">Kullanılabilir bakiye</span>
+            <span class="summary-label">
+                Kullanılabilir bakiye
+            </span>
+
             <span class="summary-value">
                 {{ "%.2f"|format(balance) }} USDT
             </span>
         </div>
 
         <div class="summary-item">
-            <span class="summary-label">Açık pozisyon</span>
+            <span class="summary-label">
+                Açık pozisyon
+            </span>
+
             <span class="summary-value">
                 {{ open_count }} / {{ max_positions }}
             </span>
         </div>
 
         <div class="summary-item">
-            <span class="summary-label">Kapanan işlem</span>
+            <span class="summary-label">
+                Kapanan işlem
+            </span>
+
             <span class="summary-value">
                 {{ trade_count }}
             </span>
         </div>
 
         <div class="summary-item">
-            <span class="summary-label">Son güncelleme</span>
+            <span class="summary-label">
+                Son güncelleme
+            </span>
+
             <span class="summary-value"
                   style="font-size: 14px;">
                 {{ current_time }}
@@ -984,12 +1280,15 @@ DASHBOARD_HTML = """
                         ) }} USDT
                     </td>
 
-                    <td>{{ position['open_time'] }}</td>
+                    <td>
+                        {{ position['open_time'] }}
+                    </td>
                 </tr>
                 {% endfor %}
             </tbody>
         </table>
     </div>
+
     {% else %}
         <div class="empty">
             Şu anda açık pozisyon yok.
@@ -1050,6 +1349,7 @@ DASHBOARD_HTML = """
             </tbody>
         </table>
     </div>
+
     {% else %}
         <div class="empty">
             Henüz kapanmış işlem yok.
@@ -1093,7 +1393,9 @@ def api_status():
 
 
 def run_dashboard():
-    port = int(os.environ.get("PORT", "8080"))
+    port = int(
+        os.environ.get("PORT", "8080")
+    )
 
     app.run(
         host="0.0.0.0",
@@ -1111,16 +1413,44 @@ def run_bot():
     print("=" * 60)
     print("PAPER TRADING BOT BAŞLATILDI")
     print("=" * 60)
-    print(f"Veri kaynağı       : {MARKET_DATA_BASE_URL}")
-    print(f"Zaman dilimi       : {TIMEFRAME}")
-    print(f"Tarama aralığı     : {SCAN_INTERVAL_SECONDS} saniye")
-    print(f"Maksimum pozisyon  : {MAX_OPEN_POSITIONS}")
-    print(f"TP                 : %{TAKE_PROFIT_PCT * 100:.2f}")
-    print(f"Pozisyon SL        : %{STOP_LOSS_PCT * 100:.2f}")
-    print(f"Trailing tetikleme : %{TRAILING_TRIGGER_PCT * 100:.2f}")
-    print(f"Trailing mesafe    : %{TRAILING_DISTANCE_PCT * 100:.2f}")
-    print(f"Başlangıç bakiye   : {INITIAL_BALANCE:.2f} USDT")
-    print("Günlük zarar kesme : YOK")
+    print(
+        f"Veri kaynağı       : "
+        f"{MARKET_DATA_BASE_URL}"
+    )
+    print(
+        f"Zaman dilimi       : {TIMEFRAME}"
+    )
+    print(
+        f"Tarama aralığı     : "
+        f"{SCAN_INTERVAL_SECONDS} saniye"
+    )
+    print(
+        f"Maksimum pozisyon  : "
+        f"{MAX_OPEN_POSITIONS}"
+    )
+    print(
+        f"TP                 : "
+        f"%{TAKE_PROFIT_PCT * 100:.2f}"
+    )
+    print(
+        f"Pozisyon SL        : "
+        f"%{STOP_LOSS_PCT * 100:.2f}"
+    )
+    print(
+        f"Trailing tetikleme : "
+        f"%{TRAILING_TRIGGER_PCT * 100:.2f}"
+    )
+    print(
+        f"Trailing mesafe    : "
+        f"%{TRAILING_DISTANCE_PCT * 100:.2f}"
+    )
+    print(
+        f"Başlangıç bakiye   : "
+        f"{INITIAL_BALANCE:.2f} USDT"
+    )
+    print(
+        "Günlük zarar kesme : YOK"
+    )
     print("=" * 60)
 
     while True:
@@ -1140,7 +1470,9 @@ def run_bot():
                         if symbol in open_positions:
                             continue
 
-                    can_trade, reason = can_open_new_trade(symbol)
+                    can_trade, reason = (
+                        can_open_new_trade(symbol)
+                    )
 
                     if not can_trade:
                         continue
@@ -1171,7 +1503,10 @@ def run_bot():
 
                     if opened:
                         with state_lock:
-                            if len(open_positions) >= MAX_OPEN_POSITIONS:
+                            if (
+                                len(open_positions)
+                                >= MAX_OPEN_POSITIONS
+                            ):
                                 break
 
                         time.sleep(0.5)
@@ -1183,7 +1518,9 @@ def run_bot():
             break
 
         except Exception as error:
-            print(f"[!] Ana döngü hatası: {error}")
+            print(
+                f"[!] Ana döngü hatası: {error}"
+            )
             time.sleep(5)
 
 
