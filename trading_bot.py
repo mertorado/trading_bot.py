@@ -9,9 +9,8 @@ from datetime import datetime
 # ==========================================
 INITIAL_BALANCE = 1000.0        # Başlangıç sanal bakiyesi (USDT)
 TRADE_ALLOCATION_PCT = 0.10     # Her işleme kasanın %10'u
-TAKE_PROFIT_PCT = 0.025         # %2.5 Kâr Al (Hızlı çıkış)
+TAKE_PROFIT_PCT = 0.025         # %2.5 Sabit TP (Trailing aktifleşmeden önceki yedek)
 STOP_LOSS_PCT = 0.012           # %1.2 Zarar Durdur
-MAX_HOLD_MINUTES = 120         # Zaman Stopu: 2 saat içinde hedefe gitmezse pozisyonu kapat
 COMMISSION_RATE = 0.001         # %0.1 Komisyon
 MAX_OPEN_POSITIONS = 5          # Aynı anda en fazla açık işlem
 SCAN_INTERVAL_SEC = 15          # Tarama sıklığı (saniye)
@@ -107,8 +106,8 @@ def get_candidate_symbols():
 def get_klines(symbol, interval="1m", limit=65):
     raw = http_get(f"/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}")
     closes = [float(k[4]) for k in raw]
-    quote_volumes = [float(k[7]) for k in raw]  # k[7] doğrudan USDT cinsinden hacimdir
-    trade_counts = [int(k[8]) for k in raw]     # k[8] mum içindeki işlem sayısıdır
+    quote_volumes = [float(k[7]) for k in raw]
+    trade_counts = [int(k[8]) for k in raw]
     return closes, quote_volumes, trade_counts
 
 # ==========================================
@@ -118,9 +117,9 @@ class DualTradingBot:
     def __init__(self):
         self.balance = INITIAL_BALANCE
         self.positions = {}
-        print("=== YÜKSEK HACİMLİ (HIGH LIQUIDITY) DAY TRADE BOTU BAŞLATILDI ===")
+        print("=== YÜKSEK HACİMLİ DAY TRADE BOTU BAŞLATILDI ===")
         print(f"Kasa: {self.balance:.2f} USDT | Min 24s Hacim: ${MIN_24H_VOLUME_USDT/1_000_000:.0f}M | Min 1m Hacim: ${MIN_1M_BAR_VOLUME_USDT:,}")
-        print(f"Hedefler: %{TAKE_PROFIT_PCT*100} TP | %{STOP_LOSS_PCT*100} SL | Zaman Stopu: {MAX_HOLD_MINUTES} dk\n")
+        print(f"Trailing: %{TRAILING_ACTIVATION_PCT*100} kârda aktif | Takip Mesafesi: %{TRAILING_STOP_PCT*100} | SL: %{STOP_LOSS_PCT*100}\n")
 
     def analyze_symbol(self, symbol):
         try:
@@ -128,7 +127,6 @@ class DualTradingBot:
             if len(closes) < 60:
                 return None, 0.0
 
-            # Son mum henüz oluşuyor olabilir; yalnızca kapanmış mumlarla sinyal üret.
             closed_closes = closes[:-1]
             closed_volumes = volumes[:-1]
             closed_trade_counts = trade_counts[:-1]
@@ -138,27 +136,22 @@ class DualTradingBot:
             previous_vol_usdt = closed_volumes[-2]
             avg_vol_usdt = sum(closed_volumes[-22:-2]) / 20
 
-            # 1. Kapanmış sinyal mumunda mutlak hacim ve yeterli işlem sayısı olmalı.
             if current_vol_usdt < MIN_1M_BAR_VOLUME_USDT:
                 return None, current_price
             if current_trade_count < MIN_TRADES_PER_1M_CANDLE:
                 return None, current_price
 
-            # 2. Hacim, son 20 mumun ortalamasının en az 4 katı olmalı.
             if avg_vol_usdt == 0 or (current_vol_usdt / avg_vol_usdt) < 4.0:
                 return None, current_price
 
-            # 3. Tek mumluk ani sıçrama yerine, önceki kapanmış mum da ortalamanın üstünde olmalı.
             if previous_vol_usdt < avg_vol_usdt * MIN_PREVIOUS_BAR_VOLUME_RATIO:
                 return None, current_price
 
-            # 4. Trend göstergesi (EMA50), yalnızca kapanmış mumlar üzerinden hesaplanır.
             ema50 = calculate_ema(closed_closes, 50)
             if not ema50:
                 return None, current_price
             current_ema50 = ema50[-1]
 
-            # 5. Momentum (MACD), yalnızca kapanmış mumlar üzerinden hesaplanır.
             macd_line, signal_line = calculate_macd(closed_closes)
             if not macd_line or len(macd_line) < 2:
                 return None, current_price
@@ -181,14 +174,12 @@ class DualTradingBot:
             return None, 0.0
 
     def check_open_positions(self):
-        current_timestamp = time.time()
         for symbol, pos in list(self.positions.items()):
             try:
                 closes, _, _ = get_klines(symbol, interval="1m", limit=2)
                 current_price = closes[-1]
                 entry_price = pos['entry_price']
                 side = pos['side']
-                elapsed_minutes = (current_timestamp - pos['timestamp']) / 60
 
                 # Kâr / Zarar hesabı
                 if side == "LONG":
@@ -198,7 +189,6 @@ class DualTradingBot:
 
                 # === TRAILING STOP MANTIĞI ===
                 if pnl_pct >= TRAILING_ACTIVATION_PCT and not pos['trailing_activated']:
-                    # Trailing stop aktif hale getir
                     pos['trailing_activated'] = True
                     if side == "LONG":
                         pos['trailing_stop_price'] = current_price * (1 - TRAILING_STOP_PCT)
@@ -224,16 +214,12 @@ class DualTradingBot:
                             self.close_position(symbol, current_price, "TRAILING STOP")
                             continue
 
-                # Normal TP / SL / Zaman Stopu (Trailing aktif değilse geçerli)
+                # Normal TP / SL (Trailing aktifleşene kadar geçerli)
                 if not pos['trailing_activated']:
                     if pnl_pct >= TAKE_PROFIT_PCT:
                         self.close_position(symbol, current_price, "KÂR AL (TP)")
                     elif pnl_pct <= -STOP_LOSS_PCT:
                         self.close_position(symbol, current_price, "ZARAR DURDUR (SL)")
-                    elif elapsed_minutes >= MAX_HOLD_MINUTES:
-                        self.close_position(symbol, current_price, f"ZAMAN STOPU ({MAX_HOLD_MINUTES} dk doldu)")
-                elif elapsed_minutes >= MAX_HOLD_MINUTES:
-                    self.close_position(symbol, current_price, f"ZAMAN STOPU ({MAX_HOLD_MINUTES} dk doldu)")
 
             except Exception as e:
                 print(f"[HATA] Pozisyon takip hatası ({symbol}): {e}")
@@ -266,7 +252,6 @@ class DualTradingBot:
             'sl_price': sl_price,
             'timestamp': time.time(),
             'entry_time': datetime.now().strftime("%H:%M:%S"),
-            # === TRAILING STOP İÇİN YENİ ALANLAR ===
             'trailing_activated': False,
             'trailing_stop_price': None,
             'highest_price': price if side == "LONG" else None,
