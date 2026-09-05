@@ -186,25 +186,147 @@ class DualTradingBot:
                 entry_price = pos['entry_price']
                 side = pos['side']
 
-                # Kâr / Zarar hesabı
                 if side == "LONG":
                     pnl_pct = (current_price - entry_price) / entry_price
                 else:
                     pnl_pct = (entry_price - current_price) / entry_price
 
-                # === TRAILING STOP MANTIĞI ===
+                # Trailing stop aktivasyonu
                 if pnl_pct >= TRAILING_ACTIVATION_PCT and not pos['trailing_activated']:
                     pos['trailing_activated'] = True
+
                     if side == "LONG":
                         pos['trailing_stop_price'] = current_price * (1 - TRAILING_STOP_PCT)
                         pos['highest_price'] = current_price
                     else:
                         pos['trailing_stop_price'] = current_price * (1 + TRAILING_STOP_PCT)
                         pos['lowest_price'] = current_price
+
                     print(f"  [TRAILING AKTİF] {symbol} | Trailing Stop: ${pos['trailing_stop_price']:.4f}")
 
+                # Trailing stop takibi
                 if pos['trailing_activated']:
                     if side == "LONG":
                         if current_price > pos['highest_price']:
                             pos['highest_price'] = current_price
                             pos['trailing_stop_price'] = current_price * (1 - TRAILING_STOP_PCT)
+
+                        if current_price <= pos['trailing_stop_price']:
+                            self.close_position(symbol, current_price, "TRAILING STOP")
+                            continue
+                    else:
+                        if current_price < pos['lowest_price']:
+                            pos['lowest_price'] = current_price
+                            pos['trailing_stop_price'] = current_price * (1 + TRAILING_STOP_PCT)
+
+                        if current_price >= pos['trailing_stop_price']:
+                            self.close_position(symbol, current_price, "TRAILING STOP")
+                            continue
+
+                # Trailing aktif olmadan önceki yedek TP ve SL
+                if not pos['trailing_activated']:
+                    if pnl_pct >= TAKE_PROFIT_PCT:
+                        self.close_position(symbol, current_price, "KÂR AL (TP)")
+                    elif pnl_pct <= -STOP_LOSS_PCT:
+                        self.close_position(symbol, current_price, "ZARAR DURDUR (SL)")
+
+            except Exception as e:
+                print(f"[HATA] Pozisyon takip hatası ({symbol}): {e}")
+
+    def open_position(self, symbol, side, price):
+        if len(self.positions) >= MAX_OPEN_POSITIONS or symbol in self.positions:
+            return
+
+        trade_amount = self.balance * TRADE_ALLOCATION_PCT
+        if trade_amount < 10.0:
+            return
+
+        commission = trade_amount * COMMISSION_RATE
+        self.balance -= (trade_amount + commission)
+        quantity = trade_amount / price
+
+        if side == "LONG":
+            tp_price = price * (1 + TAKE_PROFIT_PCT)
+            sl_price = price * (1 - STOP_LOSS_PCT)
+        else:
+            tp_price = price * (1 - TAKE_PROFIT_PCT)
+            sl_price = price * (1 + STOP_LOSS_PCT)
+
+        self.positions[symbol] = {
+            'side': side,
+            'entry_price': price,
+            'quantity': quantity,
+            'cost_usdt': trade_amount,
+            'tp_price': tp_price,
+            'sl_price': sl_price,
+            'timestamp': time.time(),
+            'entry_time': datetime.now().strftime("%H:%M:%S"),
+            'trailing_activated': False,
+            'trailing_stop_price': None,
+            'highest_price': price if side == "LONG" else None,
+            'lowest_price': price if side == "SHORT" else None
+        }
+
+        icon = "🟢 LONG" if side == "LONG" else "🔴 SHORT"
+        print(f"\n[POZİSYON AÇILDI] >> {icon} {symbol}")
+        print(f"  Giriş Fiyatı : ${price:.4f}")
+        print(f"  Tutar        : {trade_amount:.2f} USDT")
+        print(f"  Hedef TP     : ${tp_price:.4f}")
+        print(f"  Stop SL      : ${sl_price:.4f}")
+        print(f"  Kalan Bakiye : {self.balance:.2f} USDT\n")
+
+    def close_position(self, symbol, exit_price, reason):
+        pos = self.positions.pop(symbol)
+        side = pos['side']
+        entry_price = pos['entry_price']
+
+        if side == "LONG":
+            raw_pnl = pos['quantity'] * (exit_price - entry_price)
+        else:
+            raw_pnl = pos['quantity'] * (entry_price - exit_price)
+
+        exit_value = pos['cost_usdt'] + raw_pnl
+        commission = exit_value * COMMISSION_RATE
+        net_return = exit_value - commission
+        net_pnl = net_return - pos['cost_usdt']
+        pnl_pct = (net_pnl / pos['cost_usdt']) * 100
+
+        self.balance += net_return
+
+        print(f"\n[POZİSYON KAPATILDI] << {side} {symbol} ({reason})")
+        print(f"  Giriş / Çıkış: ${entry_price:.4f} -> ${exit_price:.4f}")
+        print(f"  Net K/Z      : {net_pnl:+.2f} USDT ({pnl_pct:+.2f}%)")
+        print(f"  Güncel Bakiye: {self.balance:.2f} USDT\n")
+
+    def run(self):
+        print("Piyasa taranıyor (Sadece aktif ve yüksek likiditeye sahip coinler izleniyor)...\n")
+        while True:
+            try:
+                if self.positions:
+                    self.check_open_positions()
+
+                if len(self.positions) < MAX_OPEN_POSITIONS:
+                    candidates = get_candidate_symbols()
+                    for sym in candidates:
+                        if sym in self.positions:
+                            continue
+                        side, price = self.analyze_symbol(sym)
+                        if side:
+                            self.open_position(sym, side, price)
+                            if len(self.positions) >= MAX_OPEN_POSITIONS:
+                                break
+                        time.sleep(0.05)
+
+                now = datetime.now().strftime("%H:%M:%S")
+                status = "[{}] Tarama tamamlandı. Açık: {}/{} | Bakiye: {:.2f} USDT".format(
+                    now, len(self.positions), MAX_OPEN_POSITIONS, self.balance
+                )
+                print(status)
+                time.sleep(SCAN_INTERVAL_SEC)
+
+            except Exception as e:
+                print(f"[DÖNGÜ HATASI]: {e}")
+                time.sleep(SCAN_INTERVAL_SEC)
+
+bot = DualTradingBot()
+bot.run()
