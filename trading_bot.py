@@ -1,399 +1,1202 @@
 import os
 import time
-from datetime import datetime, timedelta
+import threading
+from datetime import datetime, timezone
+
 import requests
 import pandas as pd
-import numpy as np
 from flask import Flask, jsonify, render_template_string
-from threading import Thread
 
-# ================= STRATEJİ VE ZAMANLAMA AYARLARI =================
-TIMEFRAME = "3m"               # Güvenilir 3 dakikalık mumlar
-SCAN_INTERVAL = 20             # 20 saniyede bir tarama
-TRADE_SIZE_PERCENT = 0.10      # Her işlemde bakiyenin %10'u
-MAX_OPEN_POSITIONS = 10        # Aynı anda maksimum 10 açık pozisyon
-INITIAL_BALANCE = 1000.0       # Başlangıç paper trading kasası
 
-# ================= KÂR / ZARAR VE RİSK YÖNETİMİ =================
-TAKE_PROFIT_PCT = 0.025        # %2.5 Sabit Kâr Al hedefi
-STOP_LOSS_PCT = 0.015          # %1.5 Sabit Stop Loss (pozisyon bazlı)
-TRAILING_TRIGGER_PCT = 0.012   # %1.2 kâra ulaşınca Trailing Stop aktif olur
-TRAILING_DISTANCE_PCT = 0.006  # Zirveden %0.6 geri çekilirse satış yapılır
-COMMISSION_RATE = 0.001        # %0.1 Binance Spot komisyon oranı
+# ============================================================
+# AYARLAR
+# ============================================================
 
-# ================= OVERTRADING KORUMALARI =================
+MARKET_DATA_BASE_URL = "https://api.binance.com"
+
+TIMEFRAME = "3m"
+SCAN_INTERVAL_SECONDS = 20
+
+INITIAL_BALANCE = 1000.0
+TRADE_SIZE_PERCENT = 0.10
+MAX_OPEN_POSITIONS = 10
+
+# İşlem hedefleri
+TAKE_PROFIT_PCT = 0.025
+STOP_LOSS_PCT = 0.015
+
+# Trailing stop
+TRAILING_TRIGGER_PCT = 0.012
+TRAILING_DISTANCE_PCT = 0.006
+
+# Paper trading komisyon simülasyonu
+COMMISSION_RATE = 0.001
+
+# İşlem sayısı sınırlamaları
+# Günlük zarar kesme yoktur.
 MAX_TRADES_PER_HOUR = 15
 MAX_TRADES_PER_DAY = 50
-SYMBOL_COOLDOWN_SECONDS = 900  # Pozisyon kapandıktan sonra aynı coine 15 dk yasak
 
-# Filtreler
-MIN_24H_VOLUME_USDT = 5000000  # 24s hacmi en az 5M USDT olan likit coinler
-VOLUME_SPIKE_FACTOR = 1.8      # Son mum hacmi ortalamanın en az 1.8 katı olmalı
+# Aynı coin kapandıktan sonra tekrar açılmadan önce bekleme
+SYMBOL_COOLDOWN_SECONDS = 900
 
-# ================= GLOBAL DURUM DEĞİŞKENLERİ =================
+# Coin filtreleri
+MIN_24H_VOLUME_USDT = 5_000_000
+VOLUME_SPIKE_FACTOR = 1.8
+
+# Çok düşük veya aşırı pahalı coinleri filtrele
+MIN_PRICE = 0.05
+MAX_PRICE = 100.0
+
+# Binance API isteklerinde kullanılacak sembol sayısı
+MAX_SYMBOLS_TO_SCAN = 40
+
+
+# ============================================================
+# UYGULAMA DURUMU
+# ============================================================
+
 balance = INITIAL_BALANCE
-open_positions = {}            # {symbol: pos_data}
-symbol_cooldowns = {}          # {symbol: unlock_timestamp}
-trade_history_timestamps = []  # [timestamp, ...]
-trade_log = []                 # Kapanan işlemlerin listesi (dashboard için, son 100 tanesi)
+
+open_positions = {}
+trade_log = []
+trade_history_timestamps = []
+symbol_cooldowns = {}
+
+state_lock = threading.RLock()
 
 app = Flask(__name__)
 
-# ================= BINANCE API FONKSİYONLARI =================
-def get_top_symbols():
+
+# ============================================================
+# YARDIMCI FONKSİYONLAR
+# ============================================================
+
+def utc_time_string():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def safe_float(value, default=0.0):
     try:
-        url = "https://api.binance.com/api/v3/ticker/24hr"
-        res = requests.get(url, timeout=10).json()
-        valid = []
-        for item in res:
-            sym = item.get("symbol", "")
-            if sym.endswith("USDT") and not any(x in sym for x in ["UP", "DOWN", "BEAR", "BULL"]):
-                vol = float(item.get("quoteVolume", 0))
-                price = float(item.get("lastPrice", 0))
-                if vol >= MIN_24H_VOLUME_USDT and 0.05 <= price <= 100.0:
-                    valid.append((sym, vol))
-        valid.sort(key=lambda x: x[1], reverse=True)
-        return [x[0] for x in valid[:40]]
-    except Exception as e:
-        print(f"[!] Sembol listesi hatası: {e}")
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def is_valid_symbol(symbol):
+    if not isinstance(symbol, str):
+        return False
+
+    forbidden_words = [
+        "UP",
+        "DOWN",
+        "BEAR",
+        "BULL",
+    ]
+
+    if not symbol.endswith("USDT"):
+        return False
+
+    if any(word in symbol for word in forbidden_words):
+        return False
+
+    return True
+
+
+def cleanup_old_trade_timestamps():
+    now = time.time()
+    one_day_ago = now - 86400
+
+    with state_lock:
+        trade_history_timestamps[:] = [
+            timestamp
+            for timestamp in trade_history_timestamps
+            if timestamp >= one_day_ago
+        ]
+
+
+# ============================================================
+# PİYASA VERİSİ
+# ============================================================
+
+def get_top_symbols():
+    """
+    Binance public API'den yüksek 24 saatlik hacme sahip
+    USDT paritelerini getirir.
+
+    Bu fonksiyon Binance hesabı veya API key kullanmaz.
+    """
+
+    url = f"{MARKET_DATA_BASE_URL}/api/v3/ticker/24hr"
+
+    try:
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
+
+        data = response.json()
+
+        if not isinstance(data, list):
+            print(f"[!] Sembol API'si liste döndürmedi: {data}")
+            return []
+
+        valid_symbols = []
+
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+
+            symbol = item.get("symbol", "")
+
+            if not is_valid_symbol(symbol):
+                continue
+
+            quote_volume = safe_float(item.get("quoteVolume"))
+            last_price = safe_float(item.get("lastPrice"))
+
+            if quote_volume < MIN_24H_VOLUME_USDT:
+                continue
+
+            if not MIN_PRICE <= last_price <= MAX_PRICE:
+                continue
+
+            valid_symbols.append((symbol, quote_volume))
+
+        valid_symbols.sort(
+            key=lambda item: item[1],
+            reverse=True
+        )
+
+        symbols = [
+            symbol
+            for symbol, volume in valid_symbols[:MAX_SYMBOLS_TO_SCAN]
+        ]
+
+        print(f"[+] {len(symbols)} aday sembol bulundu")
+
+        return symbols
+
+    except requests.exceptions.HTTPError as error:
+        print(f"[!] Binance HTTP hatası: {error}")
+
+        try:
+            print(f"[!] API cevabı: {response.text[:300]}")
+        except Exception:
+            pass
+
         return []
 
+    except requests.exceptions.RequestException as error:
+        print(f"[!] Piyasa verisi bağlantı hatası: {error}")
+        return []
+
+    except ValueError as error:
+        print(f"[!] API JSON cevabı okunamadı: {error}")
+        return []
+
+    except Exception as error:
+        print(f"[!] Sembol listesi hatası: {error}")
+        return []
+
+
 def get_klines_data(symbol):
+    """
+    Son 80 adet 3 dakikalık mumu getirir.
+    """
+
+    url = (
+        f"{MARKET_DATA_BASE_URL}/api/v3/klines"
+        f"?symbol={symbol}"
+        f"&interval={TIMEFRAME}"
+        f"&limit=80"
+    )
+
     try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={TIMEFRAME}&limit=60"
-        res = requests.get(url, timeout=5).json()
-        if not isinstance(res, list) or len(res) < 50:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+
+        data = response.json()
+
+        if not isinstance(data, list) or len(data) < 60:
             return None
 
-        df = pd.DataFrame(res, columns=[
-            "open_time", "open", "high", "low", "close", "volume",
-            "close_time", "q_vol", "trades", "tb_base", "tb_quote", "ignore"
-        ])
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = df[col].astype(float)
-        return df
+        columns = [
+            "open_time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "close_time",
+            "quote_volume",
+            "number_of_trades",
+            "taker_buy_base_volume",
+            "taker_buy_quote_volume",
+            "ignore",
+        ]
+
+        dataframe = pd.DataFrame(data, columns=columns)
+
+        numeric_columns = [
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "quote_volume",
+        ]
+
+        for column in numeric_columns:
+            dataframe[column] = pd.to_numeric(
+                dataframe[column],
+                errors="coerce"
+            )
+
+        dataframe = dataframe.dropna(
+            subset=numeric_columns
+        ).reset_index(drop=True)
+
+        if len(dataframe) < 60:
+            return None
+
+        return dataframe
+
+    except requests.exceptions.RequestException:
+        return None
+
+    except ValueError:
+        return None
+
     except Exception:
         return None
 
-# ================= İNDİKATÖR VE SİNYAL ANALİZİ =================
-def calculate_indicators(df):
-    close = df["close"]
 
-    df["ema_trend"] = close.ewm(span=50, adjust=False).mean()
+# ============================================================
+# TEKNİK İNDİKATÖRLER
+# ============================================================
 
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    df["macd"] = ema12 - ema26
-    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+def calculate_indicators(dataframe):
+    dataframe = dataframe.copy()
 
-    delta = close.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / (loss + 1e-9)
-    df["rsi"] = 100 - (100 / (1 + rs))
+    close = dataframe["close"]
 
-    df["vol_ma"] = df["volume"].rolling(window=20).mean()
-    return df
+    dataframe["ema_50"] = close.ewm(
+        span=50,
+        adjust=False
+    ).mean()
 
-def analyze_signal(df):
-    if df is None or len(df) < 50:
+    ema_12 = close.ewm(
+        span=12,
+        adjust=False
+    ).mean()
+
+    ema_26 = close.ewm(
+        span=26,
+        adjust=False
+    ).mean()
+
+    dataframe["macd"] = ema_12 - ema_26
+
+    dataframe["macd_signal"] = dataframe["macd"].ewm(
+        span=9,
+        adjust=False
+    ).mean()
+
+    price_change = close.diff()
+
+    gains = price_change.where(
+        price_change > 0,
+        0
+    )
+
+    losses = -price_change.where(
+        price_change < 0,
+        0
+    )
+
+    average_gain = gains.rolling(
+        window=14
+    ).mean()
+
+    average_loss = losses.rolling(
+        window=14
+    ).mean()
+
+    relative_strength = average_gain / (
+        average_loss + 1e-9
+    )
+
+    dataframe["rsi"] = 100 - (
+        100 / (1 + relative_strength)
+    )
+
+    dataframe["volume_ma"] = dataframe["volume"].rolling(
+        window=20
+    ).mean()
+
+    return dataframe
+
+
+def analyze_signal(dataframe):
+    """
+    Son tamamlanmış mumu kullanır.
+
+    - Son satır genellikle halen oluşan mum olabilir.
+    - Bu nedenle sinyal için -2 ve -3 kullanılır.
+    """
+
+    if dataframe is None or len(dataframe) < 60:
         return None
 
-    df = calculate_indicators(df)
-    curr = df.iloc[-1]
-    prev = df.iloc[-2]
+    dataframe = calculate_indicators(dataframe)
 
-    has_vol = curr["volume"] > (curr["vol_ma"] * VOLUME_SPIKE_FACTOR)
+    if len(dataframe) < 60:
+        return None
 
-    if (curr["close"] > curr["ema_trend"] and
-        prev["macd"] <= prev["macd_signal"] and curr["macd"] > curr["macd_signal"] and
-        40 <= curr["rsi"] <= 65 and
-        has_vol):
+    previous_candle = dataframe.iloc[-3]
+    current_candle = dataframe.iloc[-2]
+
+    required_values = [
+        previous_candle["close"],
+        current_candle["close"],
+        current_candle["ema_50"],
+        previous_candle["macd"],
+        previous_candle["macd_signal"],
+        current_candle["macd"],
+        current_candle["macd_signal"],
+        current_candle["rsi"],
+        current_candle["volume"],
+        current_candle["volume_ma"],
+    ]
+
+    if any(pd.isna(value) for value in required_values):
+        return None
+
+    volume_is_strong = (
+        current_candle["volume"]
+        >= current_candle["volume_ma"] * VOLUME_SPIKE_FACTOR
+    )
+
+    long_signal = (
+        current_candle["close"]
+        > current_candle["ema_50"]
+        and previous_candle["macd"]
+        <= previous_candle["macd_signal"]
+        and current_candle["macd"]
+        > current_candle["macd_signal"]
+        and 40 <= current_candle["rsi"] <= 65
+        and volume_is_strong
+    )
+
+    if long_signal:
         return "LONG"
 
-    if (curr["close"] < curr["ema_trend"] and
-        prev["macd"] >= prev["macd_signal"] and curr["macd"] < curr["macd_signal"] and
-        35 <= curr["rsi"] <= 60 and
-        has_vol):
+    short_signal = (
+        current_candle["close"]
+        < current_candle["ema_50"]
+        and previous_candle["macd"]
+        >= previous_candle["macd_signal"]
+        and current_candle["macd"]
+        < current_candle["macd_signal"]
+        and 35 <= current_candle["rsi"] <= 60
+        and volume_is_strong
+    )
+
+    if short_signal:
         return "SHORT"
 
     return None
 
-# ================= OVERTRADING KONTROLÜ =================
+
+# ============================================================
+# İŞLEM KONTROLLERİ
+# ============================================================
+
 def can_open_new_trade(symbol):
     now = time.time()
 
-    if symbol in symbol_cooldowns and now < symbol_cooldowns[symbol]:
-        wait_sec = int(symbol_cooldowns[symbol] - now)
-        return False, f"{symbol} SOĞUMA SÜRESİNDE ({wait_sec} sn)"
+    with state_lock:
+        cooldown_until = symbol_cooldowns.get(symbol, 0)
 
-    one_hour_ago = now - 3600
-    one_day_ago = now - 86400
-    recent_hour_trades = [t for t in trade_history_timestamps if t >= one_hour_ago]
-    recent_day_trades = [t for t in trade_history_timestamps if t >= one_day_ago]
+        if now < cooldown_until:
+            remaining_seconds = int(cooldown_until - now)
 
-    if len(recent_hour_trades) >= MAX_TRADES_PER_HOUR:
-        return False, "SAATLİK İŞLEM LİMİTİNE ULAŞILDI"
+            return (
+                False,
+                f"{symbol} soğuma süresinde "
+                f"({remaining_seconds} saniye)"
+            )
 
-    if len(recent_day_trades) >= MAX_TRADES_PER_DAY:
-        return False, "GÜNLÜK İŞLEM LİMİTİNE ULAŞILDI"
+        one_hour_ago = now - 3600
+        one_day_ago = now - 86400
 
-    return True, "OK"
+        hourly_trades = [
+            timestamp
+            for timestamp in trade_history_timestamps
+            if timestamp >= one_hour_ago
+        ]
 
-# ================= POZİSYON AÇMA VE KAPATMA =================
+        daily_trades = [
+            timestamp
+            for timestamp in trade_history_timestamps
+            if timestamp >= one_day_ago
+        ]
+
+        if len(hourly_trades) >= MAX_TRADES_PER_HOUR:
+            return False, "Saatlik işlem limitine ulaşıldı"
+
+        if len(daily_trades) >= MAX_TRADES_PER_DAY:
+            return False, "Günlük işlem limitine ulaşıldı"
+
+        if len(open_positions) >= MAX_OPEN_POSITIONS:
+            return False, "Maksimum açık pozisyon sayısına ulaşıldı"
+
+        return True, "OK"
+
+
+# ============================================================
+# POZİSYON AÇMA
+# ============================================================
+
 def execute_trade(symbol, side, price):
-    global balance, open_positions, trade_history_timestamps
+    global balance
 
-    trade_amt = balance * TRADE_SIZE_PERCENT
-    if trade_amt < 10.0 or len(open_positions) >= MAX_OPEN_POSITIONS:
-        return
+    with state_lock:
+        if symbol in open_positions:
+            return False
 
-    fee = trade_amt * COMMISSION_RATE
-    balance -= (trade_amt + fee)
-    trade_history_timestamps.append(time.time())
+        if len(open_positions) >= MAX_OPEN_POSITIONS:
+            return False
 
-    if side == "LONG":
-        tp = price * (1 + TAKE_PROFIT_PCT)
-        sl = price * (1 - STOP_LOSS_PCT)
-    else:
-        tp = price * (1 - TAKE_PROFIT_PCT)
-        sl = price * (1 + STOP_LOSS_PCT)
+        trade_amount = balance * TRADE_SIZE_PERCENT
 
-    open_positions[symbol] = {
-        "side": side,
-        "entry_price": price,
-        "amount": trade_amt,
-        "tp": tp,
-        "sl": sl,
-        "peak_price": price,
-        "trailing_active": False,
-        "open_time": time.time()
-    }
+        if trade_amount < 10:
+            print("[!] İşlem tutarı 10 USDT altında kaldı")
+            return False
 
-    icon = "🟢" if side == "LONG" else "🔴"
-    print(f"\n[POZİSYON AÇILDI] >> {icon} {side} {symbol}")
-    print(f"  Giriş Fiyatı : ${price:.4f} | Bütçe: {trade_amt:.2f} USDT")
-    print(f"  Hedef TP     : ${tp:.4f} | Stop SL: ${sl:.4f}")
-    print(f"  Kalan Bakiye : {balance:.2f} USDT\n")
+        entry_fee = trade_amount * COMMISSION_RATE
 
-def manage_positions():
-    global balance, open_positions, symbol_cooldowns, trade_log
-    closed = []
-
-    for symbol, pos in open_positions.items():
-        df = get_klines_data(symbol)
-        if df is None:
-            continue
-
-        curr_price = df.iloc[-1]["close"]
-        high_price = df.iloc[-1]["high"]
-        low_price = df.iloc[-1]["low"]
-
-        side = pos["side"]
-        entry = pos["entry_price"]
-        amt = pos["amount"]
-
-        exit_reason = None
-        exit_price = curr_price
+        if balance < trade_amount + entry_fee:
+            print("[!] Yeterli paper trading bakiyesi yok")
+            return False
 
         if side == "LONG":
-            pos["peak_price"] = max(pos["peak_price"], high_price)
-            peak_pct = (pos["peak_price"] - entry) / entry
+            take_profit = price * (1 + TAKE_PROFIT_PCT)
+            stop_loss = price * (1 - STOP_LOSS_PCT)
+        else:
+            take_profit = price * (1 - TAKE_PROFIT_PCT)
+            stop_loss = price * (1 + STOP_LOSS_PCT)
 
-            if peak_pct >= TRAILING_TRIGGER_PCT:
-                pos["trailing_active"] = True
+        balance -= trade_amount + entry_fee
 
-            if pos["trailing_active"]:
-                trail_stop = pos["peak_price"] * (1 - TRAILING_DISTANCE_PCT)
-                if low_price <= trail_stop:
-                    exit_reason = "TRAILING STOP"
-                    exit_price = trail_stop
-            elif low_price <= pos["sl"]:
-                exit_reason = "STOP LOSS (SL)"
-                exit_price = pos["sl"]
-            elif high_price >= pos["tp"]:
-                exit_reason = "TAKE PROFIT (TP)"
-                exit_price = pos["tp"]
+        open_positions[symbol] = {
+            "symbol": symbol,
+            "side": side,
+            "entry_price": price,
+            "amount": trade_amount,
+            "entry_fee": entry_fee,
+            "take_profit": take_profit,
+            "stop_loss": stop_loss,
+            "peak_price": price,
+            "trailing_active": False,
+            "open_time": utc_time_string(),
+            "last_price": price,
+            "unrealized_pnl": 0.0,
+        }
 
-        else:  # SHORT
-            pos["peak_price"] = min(pos["peak_price"], low_price)
-            peak_pct = (entry - pos["peak_price"]) / entry
+        trade_history_timestamps.append(time.time())
 
-            if peak_pct >= TRAILING_TRIGGER_PCT:
-                pos["trailing_active"] = True
+        icon = "LONG" if side == "LONG" else "SHORT"
 
-            if pos["trailing_active"]:
-                trail_stop = pos["peak_price"] * (1 + TRAILING_DISTANCE_PCT)
-                if high_price >= trail_stop:
-                    exit_reason = "TRAILING STOP"
-                    exit_price = trail_stop
-            elif high_price >= pos["sl"]:
-                exit_reason = "STOP LOSS (SL)"
-                exit_price = pos["sl"]
-            elif low_price <= pos["tp"]:
-                exit_reason = "TAKE PROFIT (TP)"
-                exit_price = pos["tp"]
+        print()
+        print(f"[POZİSYON AÇILDI] {icon} {symbol}")
+        print(f"  Giriş fiyatı : ${price:.8f}")
+        print(f"  İşlem tutarı : {trade_amount:.2f} USDT")
+        print(f"  TP           : ${take_profit:.8f}")
+        print(f"  SL           : ${stop_loss:.8f}")
+        print(f"  Kalan bakiye : {balance:.2f} USDT")
+        print()
 
-        if exit_reason:
+        return True
+
+
+# ============================================================
+# POZİSYON YÖNETİMİ
+# ============================================================
+
+def calculate_unrealized_pnl(position, current_price):
+    entry_price = position["entry_price"]
+    amount = position["amount"]
+    side = position["side"]
+
+    if side == "LONG":
+        gross_value = amount * (
+            current_price / entry_price
+        )
+    else:
+        gross_value = amount * (
+            1 + (entry_price - current_price) / entry_price
+        )
+
+    estimated_exit_fee = gross_value * COMMISSION_RATE
+
+    return (
+        gross_value
+        - estimated_exit_fee
+        - amount
+        - position["entry_fee"]
+    )
+
+
+def close_position(symbol, position, exit_price, exit_reason):
+    global balance
+
+    entry_price = position["entry_price"]
+    amount = position["amount"]
+    entry_fee = position["entry_fee"]
+    side = position["side"]
+
+    if side == "LONG":
+        gross_return = amount * (
+            exit_price / entry_price
+        )
+    else:
+        gross_return = amount * (
+            1 + (entry_price - exit_price) / entry_price
+        )
+
+    exit_fee = gross_return * COMMISSION_RATE
+    net_return = gross_return - exit_fee
+
+    total_pnl = net_return - amount - entry_fee
+
+    balance += net_return
+
+    symbol_cooldowns[symbol] = (
+        time.time() + SYMBOL_COOLDOWN_SECONDS
+    )
+
+    pnl_percent = (
+        total_pnl / amount
+    ) * 100
+
+    trade_entry = {
+        "symbol": symbol,
+        "side": side,
+        "reason": exit_reason,
+        "entry": round(entry_price, 8),
+        "exit": round(exit_price, 8),
+        "pnl": round(total_pnl, 4),
+        "pnl_pct": round(pnl_percent, 4),
+        "time": utc_time_string(),
+    }
+
+    trade_log.insert(0, trade_entry)
+
+    del trade_log[100:]
+
+    result_icon = "KAR" if total_pnl >= 0 else "ZARAR"
+
+    print()
+    print(
+        f"[POZİSYON KAPATILDI] "
+        f"{result_icon} {side} {symbol}"
+    )
+    print(f"  Sebep        : {exit_reason}")
+    print(
+        f"  Giriş/Çıkış   : "
+        f"${entry_price:.8f} -> ${exit_price:.8f}"
+    )
+    print(
+        f"  Net K/Z       : "
+        f"{total_pnl:+.4f} USDT "
+        f"({pnl_percent:+.4f}%)"
+    )
+    print(f"  Güncel bakiye : {balance:.4f} USDT")
+    print()
+
+
+def manage_positions():
+    with state_lock:
+        symbols = list(open_positions.keys())
+
+    for symbol in symbols:
+        dataframe = get_klines_data(symbol)
+
+        if dataframe is None or len(dataframe) < 2:
+            continue
+
+        # Son tamamlanmış mum
+        completed_candle = dataframe.iloc[-2]
+
+        current_price = safe_float(
+            completed_candle["close"]
+        )
+
+        candle_high = safe_float(
+            completed_candle["high"]
+        )
+
+        candle_low = safe_float(
+            completed_candle["low"]
+        )
+
+        with state_lock:
+            if symbol not in open_positions:
+                continue
+
+            position = open_positions[symbol]
+
+            side = position["side"]
+            entry_price = position["entry_price"]
+
+            position["last_price"] = current_price
+            position["unrealized_pnl"] = round(
+                calculate_unrealized_pnl(
+                    position,
+                    current_price
+                ),
+                4
+            )
+
+            exit_reason = None
+            exit_price = current_price
+
             if side == "LONG":
-                gross_return = amt * (exit_price / entry)
+                position["peak_price"] = max(
+                    position["peak_price"],
+                    candle_high
+                )
+
+                profit_from_entry = (
+                    position["peak_price"]
+                    - entry_price
+                ) / entry_price
+
+                if profit_from_entry >= TRAILING_TRIGGER_PCT:
+                    position["trailing_active"] = True
+
+                if position["trailing_active"]:
+                    trailing_stop = (
+                        position["peak_price"]
+                        * (1 - TRAILING_DISTANCE_PCT)
+                    )
+
+                    if candle_low <= trailing_stop:
+                        exit_reason = "TRAILING STOP"
+                        exit_price = trailing_stop
+
+                elif candle_low <= position["stop_loss"]:
+                    exit_reason = "STOP LOSS"
+                    exit_price = position["stop_loss"]
+
+                elif candle_high >= position["take_profit"]:
+                    exit_reason = "TAKE PROFIT"
+                    exit_price = position["take_profit"]
+
             else:
-                gross_return = amt * (1 + (entry - exit_price) / entry)
+                position["peak_price"] = min(
+                    position["peak_price"],
+                    candle_low
+                )
 
-            fee = gross_return * COMMISSION_RATE
-            net_return = gross_return - fee
-            pnl = net_return - amt
-            balance += net_return
-            closed.append(symbol)
+                profit_from_entry = (
+                    entry_price
+                    - position["peak_price"]
+                ) / entry_price
 
-            # Kapanan coine 15 dk soğuma süresi
-            symbol_cooldowns[symbol] = time.time() + SYMBOL_COOLDOWN_SECONDS
+                if profit_from_entry >= TRAILING_TRIGGER_PCT:
+                    position["trailing_active"] = True
 
-            icon = "✅" if pnl > 0 else "❌"
-            print(f"\n[POZİSYON KAPATILDI] << {icon} {side} {symbol} ({exit_reason})")
-            print(f"  Giriş/Çıkış: ${entry:.4f} -> ${exit_price:.4f}")
-            print(f"  Net K/Z    : {pnl:+.2f} USDT ({((net_return/amt)-1)*100:+.2f}%)")
-            print(f"  Güncel Bakiye: {balance:.2f} USDT\n")
+                if position["trailing_active"]:
+                    trailing_stop = (
+                        position["peak_price"]
+                        * (1 + TRAILING_DISTANCE_PCT)
+                    )
 
-            trade_log.insert(0, {
-                "symbol": symbol,
-                "side": side,
-                "reason": exit_reason,
-                "entry": round(entry, 4),
-                "exit": round(exit_price, 4),
-                "pnl": round(pnl, 2),
-                "pnl_pct": round((net_return / amt - 1) * 100, 2),
-                "time": datetime.utcnow().strftime("%H:%M:%S")
-            })
-            trade_log[:] = trade_log[:100]
+                    if candle_high >= trailing_stop:
+                        exit_reason = "TRAILING STOP"
+                        exit_price = trailing_stop
 
-    for sym in closed:
-        del open_positions[sym]
+                elif candle_high >= position["stop_loss"]:
+                    exit_reason = "STOP LOSS"
+                    exit_price = position["stop_loss"]
 
-# ================= WEB DASHBOARD =================
+                elif candle_low <= position["take_profit"]:
+                    exit_reason = "TAKE PROFIT"
+                    exit_price = position["take_profit"]
+
+            if exit_reason is not None:
+                close_position(
+                    symbol,
+                    position,
+                    exit_price,
+                    exit_reason
+                )
+
+                del open_positions[symbol]
+
+
+# ============================================================
+# WEB DASHBOARD
+# ============================================================
+
 DASHBOARD_HTML = """
 <!DOCTYPE html>
-<html>
+<html lang="tr">
 <head>
-<title>Trading Bot Panel</title>
-<meta http-equiv="refresh" content="10">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<style>
-body { background:#0f1117; color:#e5e7eb; font-family: monospace; padding:20px; }
-h2 { color:#22c55e; margin-top:30px; }
-table { width:100%; border-collapse: collapse; margin-bottom:20px; }
-th, td { padding:8px 12px; border-bottom:1px solid #262b36; text-align:left; white-space:nowrap; }
-th { color:#9ca3af; text-transform:uppercase; font-size:11px; }
-.long { color:#22c55e; } .short { color:#ef4444; }
-.pos { color:#22c55e; } .neg { color:#ef4444; }
-.balance { font-size:22px; margin-bottom:20px; }
-.wrap { overflow-x:auto; }
-.empty { color:#6b7280; padding:10px 0; }
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport"
+          content="width=device-width, initial-scale=1.0">
+
+    <meta http-equiv="refresh" content="10">
+
+    <title>Paper Trading Dashboard</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            padding: 24px;
+            background: #101318;
+            color: #e5e7eb;
+            font-family: Arial, sans-serif;
+        }
+
+        h1 {
+            margin: 0 0 8px 0;
+            color: #f9fafb;
+            font-size: 26px;
+        }
+
+        h2 {
+            margin-top: 32px;
+            color: #60a5fa;
+            font-size: 20px;
+        }
+
+        .subtitle {
+            color: #9ca3af;
+            margin-bottom: 24px;
+        }
+
+        .summary {
+            display: grid;
+            grid-template-columns:
+                repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px;
+            margin-bottom: 24px;
+        }
+
+        .summary-item {
+            border: 1px solid #29313d;
+            background: #171b22;
+            padding: 16px;
+        }
+
+        .summary-label {
+            display: block;
+            color: #9ca3af;
+            font-size: 12px;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+        }
+
+        .summary-value {
+            color: #f9fafb;
+            font-size: 22px;
+            font-weight: bold;
+        }
+
+        .table-wrapper {
+            width: 100%;
+            overflow-x: auto;
+            border: 1px solid #29313d;
+        }
+
+        table {
+            width: 100%;
+            min-width: 900px;
+            border-collapse: collapse;
+            background: #171b22;
+        }
+
+        th,
+        td {
+            padding: 12px;
+            border-bottom: 1px solid #29313d;
+            text-align: left;
+            white-space: nowrap;
+        }
+
+        th {
+            color: #9ca3af;
+            font-size: 11px;
+            text-transform: uppercase;
+        }
+
+        td {
+            color: #e5e7eb;
+            font-size: 13px;
+        }
+
+        .long {
+            color: #4ade80;
+            font-weight: bold;
+        }
+
+        .short {
+            color: #f87171;
+            font-weight: bold;
+        }
+
+        .profit {
+            color: #4ade80;
+        }
+
+        .loss {
+            color: #f87171;
+        }
+
+        .empty {
+            border: 1px solid #29313d;
+            background: #171b22;
+            padding: 18px;
+            color: #9ca3af;
+        }
+
+        .footer {
+            margin-top: 28px;
+            color: #6b7280;
+            font-size: 12px;
+        }
+    </style>
 </head>
+
 <body>
-<div class="balance">💰 Bakiye: {{ balance }} USDT &nbsp; | &nbsp; Açık Pozisyon: {{ open_count }}</div>
+    <h1>Paper Trading Dashboard</h1>
 
-<h2>Açık Pozisyonlar</h2>
-<div class="wrap">
-<table>
-<tr><th>Coin</th><th>Yön</th><th>Giriş</th><th>TP</th><th>SL</th><th>Trailing</th></tr>
-{% for sym, p in positions.items() %}
-<tr>
-<td>{{ sym }}</td>
-<td class="{{ 'long' if p.side=='LONG' else 'short' }}">{{ p.side }}</td>
-<td>${{ '%.4f'|format(p.entry_price) }}</td>
-<td>${{ '%.4f'|format(p.tp) }}</td>
-<td>${{ '%.4f'|format(p.sl) }}</td>
-<td>{{ 'Aktif' if p.trailing_active else '-' }}</td>
-</tr>
-{% endfor %}
-</table>
-{% if not positions %}<div class="empty">Şu anda açık pozisyon yok.</div>{% endif %}
-</div>
+    <div class="subtitle">
+        Veri kaynağı: Binance public market data |
+        İşlemler sanal
+    </div>
 
-<h2>Son İşlemler</h2>
-<div class="wrap">
-<table>
-<tr><th>Saat</th><th>Coin</th><th>Yön</th><th>Sonuç</th><th>Giriş→Çıkış</th><th>K/Z</th></tr>
-{% for t in trades %}
-<tr>
-<td>{{ t.time }}</td>
-<td>{{ t.symbol }}</td>
-<td class="{{ 'long' if t.side=='LONG' else 'short' }}">{{ t.side }}</td>
-<td>{{ t.reason }}</td>
-<td>${{ t.entry }} → ${{ t.exit }}</td>
-<td class="{{ 'pos' if t.pnl >= 0 else 'neg' }}">{{ t.pnl }} USDT ({{ t.pnl_pct }}%)</td>
-</tr>
-{% endfor %}
-</table>
-{% if not trades %}<div class="empty">Henüz kapanan işlem yok.</div>{% endif %}
-</div>
+    <section class="summary">
+        <div class="summary-item">
+            <span class="summary-label">Kullanılabilir bakiye</span>
+            <span class="summary-value">
+                {{ "%.2f"|format(balance) }} USDT
+            </span>
+        </div>
+
+        <div class="summary-item">
+            <span class="summary-label">Açık pozisyon</span>
+            <span class="summary-value">
+                {{ open_count }} / {{ max_positions }}
+            </span>
+        </div>
+
+        <div class="summary-item">
+            <span class="summary-label">Kapanan işlem</span>
+            <span class="summary-value">
+                {{ trade_count }}
+            </span>
+        </div>
+
+        <div class="summary-item">
+            <span class="summary-label">Son güncelleme</span>
+            <span class="summary-value"
+                  style="font-size: 14px;">
+                {{ current_time }}
+            </span>
+        </div>
+    </section>
+
+    <h2>Açık Pozisyonlar</h2>
+
+    {% if positions %}
+    <div class="table-wrapper">
+        <table>
+            <thead>
+                <tr>
+                    <th>Coin</th>
+                    <th>Yön</th>
+                    <th>Giriş</th>
+                    <th>Son fiyat</th>
+                    <th>TP</th>
+                    <th>SL</th>
+                    <th>Trailing</th>
+                    <th>Anlık K/Z</th>
+                    <th>Açılış</th>
+                </tr>
+            </thead>
+
+            <tbody>
+                {% for symbol, position in positions.items() %}
+                <tr>
+                    <td>{{ symbol }}</td>
+
+                    <td class="
+                        {{ 'long'
+                           if position['side'] == 'LONG'
+                           else 'short' }}">
+                        {{ position['side'] }}
+                    </td>
+
+                    <td>
+                        ${{ "%.8f"|format(
+                            position['entry_price']
+                        ) }}
+                    </td>
+
+                    <td>
+                        ${{ "%.8f"|format(
+                            position['last_price']
+                        ) }}
+                    </td>
+
+                    <td>
+                        ${{ "%.8f"|format(
+                            position['take_profit']
+                        ) }}
+                    </td>
+
+                    <td>
+                        ${{ "%.8f"|format(
+                            position['stop_loss']
+                        ) }}
+                    </td>
+
+                    <td>
+                        {{ "AKTİF"
+                           if position['trailing_active']
+                           else "Bekliyor" }}
+                    </td>
+
+                    <td class="
+                        {{ 'profit'
+                           if position['unrealized_pnl'] >= 0
+                           else 'loss' }}">
+                        {{ "%.4f"|format(
+                            position['unrealized_pnl']
+                        ) }} USDT
+                    </td>
+
+                    <td>{{ position['open_time'] }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+        <div class="empty">
+            Şu anda açık pozisyon yok.
+        </div>
+    {% endif %}
+
+    <h2>Son Kapanan İşlemler</h2>
+
+    {% if trades %}
+    <div class="table-wrapper">
+        <table>
+            <thead>
+                <tr>
+                    <th>Zaman</th>
+                    <th>Coin</th>
+                    <th>Yön</th>
+                    <th>Sebep</th>
+                    <th>Giriş</th>
+                    <th>Çıkış</th>
+                    <th>Net K/Z</th>
+                    <th>Yüzde</th>
+                </tr>
+            </thead>
+
+            <tbody>
+                {% for trade in trades %}
+                <tr>
+                    <td>{{ trade['time'] }}</td>
+                    <td>{{ trade['symbol'] }}</td>
+
+                    <td class="
+                        {{ 'long'
+                           if trade['side'] == 'LONG'
+                           else 'short' }}">
+                        {{ trade['side'] }}
+                    </td>
+
+                    <td>{{ trade['reason'] }}</td>
+
+                    <td>${{ trade['entry'] }}</td>
+                    <td>${{ trade['exit'] }}</td>
+
+                    <td class="
+                        {{ 'profit'
+                           if trade['pnl'] >= 0
+                           else 'loss' }}">
+                        {{ trade['pnl'] }} USDT
+                    </td>
+
+                    <td class="
+                        {{ 'profit'
+                           if trade['pnl_pct'] >= 0
+                           else 'loss' }}">
+                        {{ trade['pnl_pct'] }}%
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+        <div class="empty">
+            Henüz kapanmış işlem yok.
+        </div>
+    {% endif %}
+
+    <div class="footer">
+        Sayfa 10 saniyede bir yenilenir.
+    </div>
 </body>
 </html>
 """
 
+
 @app.route("/")
 def dashboard():
-    return render_template_string(
-        DASHBOARD_HTML,
-        balance=round(balance, 2),
-        open_count=len(open_positions),
-        positions=open_positions,
-        trades=trade_log
-    )
+    with state_lock:
+        return render_template_string(
+            DASHBOARD_HTML,
+            balance=balance,
+            open_count=len(open_positions),
+            max_positions=MAX_OPEN_POSITIONS,
+            trade_count=len(trade_log),
+            current_time=utc_time_string(),
+            positions=dict(open_positions),
+            trades=list(trade_log),
+        )
+
 
 @app.route("/api/status")
 def api_status():
-    return jsonify({
-        "balance": round(balance, 2),
-        "open_positions": open_positions,
-        "trade_history": trade_log
-    })
+    with state_lock:
+        return jsonify(
+            {
+                "balance": round(balance, 4),
+                "open_positions": open_positions,
+                "trade_history": trade_log,
+                "server_time": utc_time_string(),
+            }
+        )
+
 
 def run_dashboard():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", "8080"))
 
-# ================= ANA ÇALIŞMA DÖNGÜSÜ =================
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        use_reloader=False,
+    )
+
+
+# ============================================================
+# ANA BOT DÖNGÜSÜ
+# ============================================================
+
 def run_bot():
-    print("=" * 55)
-    print("🚀 GELİŞMİŞ AL-SAT BOTU BAŞLATILDI (Dashboard Aktif, Max 10 Pozisyon)")
-    print(f"  Zaman Dilimi   : {TIMEFRAME}")
-    print(f"  Hedefler       : %{TAKE_PROFIT_PCT*100} TP | %{STOP_LOSS_PCT*100} SL")
-    print(f"  Trailing Stop  : %{TRAILING_TRIGGER_PCT*100} Kar -> %{TRAILING_DISTANCE_PCT*100} Takip")
-    print(f"  Max Pozisyon   : {MAX_OPEN_POSITIONS}")
-    print(f"  Başlangıç Kasa : {balance:.2f} USDT")
-    print("=" * 55)
+    print("=" * 60)
+    print("PAPER TRADING BOT BAŞLATILDI")
+    print("=" * 60)
+    print(f"Veri kaynağı       : {MARKET_DATA_BASE_URL}")
+    print(f"Zaman dilimi       : {TIMEFRAME}")
+    print(f"Tarama aralığı     : {SCAN_INTERVAL_SECONDS} saniye")
+    print(f"Maksimum pozisyon  : {MAX_OPEN_POSITIONS}")
+    print(f"TP                 : %{TAKE_PROFIT_PCT * 100:.2f}")
+    print(f"Pozisyon SL        : %{STOP_LOSS_PCT * 100:.2f}")
+    print(f"Trailing tetikleme : %{TRAILING_TRIGGER_PCT * 100:.2f}")
+    print(f"Trailing mesafe    : %{TRAILING_DISTANCE_PCT * 100:.2f}")
+    print(f"Başlangıç bakiye   : {INITIAL_BALANCE:.2f} USDT")
+    print("Günlük zarar kesme : YOK")
+    print("=" * 60)
 
     while True:
         try:
+            cleanup_old_trade_timestamps()
+
             manage_positions()
 
-            if len(open_positions) < MAX_OPEN_POSITIONS:
-                symbols = get_top_symbols()
-                for sym in symbols:
-                    if sym in open_positions:
-                        continue
+            with state_lock:
+                position_count = len(open_positions)
 
-                    can_trade, reason = can_open_new_trade(sym)
+            if position_count < MAX_OPEN_POSITIONS:
+                symbols = get_top_symbols()
+
+                for symbol in symbols:
+                    with state_lock:
+                        if symbol in open_positions:
+                            continue
+
+                    can_trade, reason = can_open_new_trade(symbol)
+
                     if not can_trade:
                         continue
 
-                    df = get_klines_data(sym)
-                    signal = analyze_signal(df)
-                    if signal:
-                        curr_price = df.iloc[-1]["close"]
-                        execute_trade(sym, signal, curr_price)
-                        if len(open_positions) >= MAX_OPEN_POSITIONS:
-                            break
+                    dataframe = get_klines_data(symbol)
+
+                    if dataframe is None:
+                        continue
+
+                    signal = analyze_signal(dataframe)
+
+                    if signal is None:
+                        continue
+
+                    # Sinyal son tamamlanmış mumdan alınır
+                    signal_price = safe_float(
+                        dataframe.iloc[-2]["close"]
+                    )
+
+                    if signal_price <= 0:
+                        continue
+
+                    opened = execute_trade(
+                        symbol,
+                        signal,
+                        signal_price
+                    )
+
+                    if opened:
+                        with state_lock:
+                            if len(open_positions) >= MAX_OPEN_POSITIONS:
+                                break
+
                         time.sleep(0.5)
 
-            time.sleep(SCAN_INTERVAL)
-        except Exception as e:
-            print(f"[!] Döngü hatası: {e}")
+            time.sleep(SCAN_INTERVAL_SECONDS)
+
+        except KeyboardInterrupt:
+            print("\nBot durduruldu.")
+            break
+
+        except Exception as error:
+            print(f"[!] Ana döngü hatası: {error}")
             time.sleep(5)
 
+
+# ============================================================
+# BAŞLAT
+# ============================================================
+
 if __name__ == "__main__":
-    Thread(target=run_dashboard, daemon=True).start()
+    dashboard_thread = threading.Thread(
+        target=run_dashboard,
+        daemon=True
+    )
+
+    dashboard_thread.start()
+
     run_bot()
