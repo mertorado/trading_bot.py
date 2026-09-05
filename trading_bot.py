@@ -110,6 +110,15 @@ def get_klines(symbol, interval="1m", limit=65):
     trade_counts = [int(k[8]) for k in raw]
     return closes, quote_volumes, trade_counts
 
+def get_klines_hl(symbol, interval="1m", limit=2):
+    """Sadece son mum(lar)ın high/low değerlerini döndürür.
+    Pozisyon takibinde ani fitilleri (wick) kaçırmamak için kullanılır."""
+    raw = http_get(f"/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}")
+    closes = [float(k[4]) for k in raw]
+    highs = [float(k[2]) for k in raw]
+    lows = [float(k[3]) for k in raw]
+    return closes, highs, lows
+
 # ==========================================
 # LONG & SHORT DAY TRADING MOTORU
 # ==========================================
@@ -181,54 +190,75 @@ class DualTradingBot:
     def check_open_positions(self):
         for symbol, pos in list(self.positions.items()):
             try:
-                closes, _, _ = get_klines(symbol, interval="1m", limit=2)
+                closes, highs, lows = get_klines_hl(symbol, interval="1m", limit=2)
                 current_price = closes[-1]
                 entry_price = pos['entry_price']
                 side = pos['side']
 
+                # Son 2 mumun en iyi (lehe) ve en kötü (aleyhe) fiyatlarını al.
+                # Bu sayede bot sadece 15sn'lik anlık fiyatı değil, aradaki
+                # fitili (wick) de görmüş olur ve trailing'i zamanında aktif eder.
                 if side == "LONG":
-                    pnl_pct = (current_price - entry_price) / entry_price
+                    best_price = max(highs)   # lehe hareket = yukarı
+                    worst_price = min(lows)   # aleyhe hareket = aşağı
                 else:
-                    pnl_pct = (entry_price - current_price) / entry_price
+                    best_price = min(lows)    # lehe hareket = aşağı
+                    worst_price = max(highs)  # aleyhe hareket = yukarı
 
-                # Trailing stop aktivasyonu
-                if pnl_pct >= TRAILING_ACTIVATION_PCT and not pos['trailing_activated']:
+                if side == "LONG":
+                    pnl_pct_best = (best_price - entry_price) / entry_price
+                else:
+                    pnl_pct_best = (entry_price - best_price) / entry_price
+
+                # === TRAILING STOP AKTİVASYONU (en iyi fiyata göre) ===
+                if pnl_pct_best >= TRAILING_ACTIVATION_PCT and not pos['trailing_activated']:
                     pos['trailing_activated'] = True
 
                     if side == "LONG":
-                        pos['trailing_stop_price'] = current_price * (1 - TRAILING_STOP_PCT)
-                        pos['highest_price'] = current_price
+                        pos['highest_price'] = best_price
+                        pos['trailing_stop_price'] = best_price * (1 - TRAILING_STOP_PCT)
                     else:
-                        pos['trailing_stop_price'] = current_price * (1 + TRAILING_STOP_PCT)
-                        pos['lowest_price'] = current_price
+                        pos['lowest_price'] = best_price
+                        pos['trailing_stop_price'] = best_price * (1 + TRAILING_STOP_PCT)
 
-                    print(f"  [TRAILING AKTİF] {symbol} | Trailing Stop: ${pos['trailing_stop_price']:.4f}")
+                    print(f"  [TRAILING AKTİF] {symbol} | En İyi Fiyat: ${best_price:.4f} | Trailing Stop: ${pos['trailing_stop_price']:.4f}")
 
-                # Trailing stop takibi
+                # === TRAILING STOP TAKİBİ ===
                 if pos['trailing_activated']:
                     if side == "LONG":
-                        if current_price > pos['highest_price']:
-                            pos['highest_price'] = current_price
-                            pos['trailing_stop_price'] = current_price * (1 - TRAILING_STOP_PCT)
+                        if best_price > pos['highest_price']:
+                            pos['highest_price'] = best_price
+                            pos['trailing_stop_price'] = best_price * (1 - TRAILING_STOP_PCT)
 
-                        if current_price <= pos['trailing_stop_price']:
-                            self.close_position(symbol, current_price, "TRAILING STOP")
+                        # Aleyhe fitil trailing seviyesine değdi mi kontrol et
+                        if worst_price <= pos['trailing_stop_price']:
+                            self.close_position(symbol, pos['trailing_stop_price'], "TRAILING STOP")
                             continue
                     else:
-                        if current_price < pos['lowest_price']:
-                            pos['lowest_price'] = current_price
-                            pos['trailing_stop_price'] = current_price * (1 + TRAILING_STOP_PCT)
+                        if best_price < pos['lowest_price']:
+                            pos['lowest_price'] = best_price
+                            pos['trailing_stop_price'] = best_price * (1 + TRAILING_STOP_PCT)
 
-                        if current_price >= pos['trailing_stop_price']:
-                            self.close_position(symbol, current_price, "TRAILING STOP")
+                        if worst_price >= pos['trailing_stop_price']:
+                            self.close_position(symbol, pos['trailing_stop_price'], "TRAILING STOP")
                             continue
 
-                # Trailing aktif olmadan önceki yedek TP ve SL
+                # === TRAILING AKTİF OLMADAN ÖNCEKİ YEDEK TP VE SL ===
                 if not pos['trailing_activated']:
-                    if pnl_pct >= TAKE_PROFIT_PCT:
-                        self.close_position(symbol, current_price, "KÂR AL (TP)")
-                    elif pnl_pct <= -STOP_LOSS_PCT:
-                        self.close_position(symbol, current_price, "ZARAR DURDUR (SL)")
+                    if pnl_pct_best >= TAKE_PROFIT_PCT:
+                        tp_exit = entry_price * (1 + TAKE_PROFIT_PCT) if side == "LONG" else entry_price * (1 - TAKE_PROFIT_PCT)
+                        self.close_position(symbol, tp_exit, "KÂR AL (TP)")
+                        continue
+
+                    if side == "LONG":
+                        worst_pnl_pct = (worst_price - entry_price) / entry_price
+                    else:
+                        worst_pnl_pct = (entry_price - worst_price) / entry_price
+
+                    if worst_pnl_pct <= -STOP_LOSS_PCT:
+                        sl_exit = entry_price * (1 - STOP_LOSS_PCT) if side == "LONG" else entry_price * (1 + STOP_LOSS_PCT)
+                        self.close_position(symbol, sl_exit, "ZARAR DURDUR (SL)")
+                        continue
 
             except Exception as e:
                 print(f"[HATA] Pozisyon takip hatası ({symbol}): {e}")
