@@ -5,12 +5,12 @@ import urllib.request
 from datetime import datetime
 
 # ==========================================
-# BOT VE RİSK YÖNETİMİ AYARLARI
+# BOT VE RİSK YÖNETİMİ AYARLARI (DENGELİ SCALPER)
 # ==========================================
 INITIAL_BALANCE = 1000.0        # Başlangıç sanal bakiyesi (USDT)
 TRADE_ALLOCATION_PCT = 0.10     # Her işleme kasanın %10'u
-TAKE_PROFIT_PCT = 0.025         # %2.5 Sabit TP (Trailing aktifleşmeden önceki yedek)
-STOP_LOSS_PCT = 0.012           # %1.2 Zarar Durdur
+TAKE_PROFIT_PCT = 0.020         # %2.0 Sabit TP (Yedek)
+STOP_LOSS_PCT = 0.010           # %1.0 Zarar Durdur
 COMMISSION_RATE = 0.001         # %0.1 Komisyon
 MAX_OPEN_POSITIONS = 5          # Aynı anda en fazla açık işlem
 SCAN_INTERVAL_SEC = 15          # Tarama sıklığı (saniye)
@@ -18,13 +18,13 @@ SCAN_INTERVAL_SEC = 15          # Tarama sıklığı (saniye)
 MIN_PRICE = 1.0                 # Taranacak min coin fiyatı ($)
 MAX_PRICE = 50.0                # Taranacak max coin fiyatı ($)
 MIN_24H_VOLUME_USDT = 5_000_000 # 24s hacmi 5M USDT'nin altındaki coinleri ele
-MIN_1M_BAR_VOLUME_USDT = 15_000 # Kapanmış sinyal mumunda en az 15.000 USDT hacim olmalı
-MIN_TRADES_PER_1M_CANDLE = 15   # Kapanmış sinyal mumunda en az 15 işlem olmalı
-MIN_PREVIOUS_BAR_VOLUME_RATIO = 1.0  # Önceki kapanmış mum, 20 mumluk ortalamanın en az bu katı olmalı
+MIN_1M_BAR_VOLUME_USDT = 8_000  # Kapanmış mumda en az 8.000 USDT hacim
+MIN_TRADES_PER_1M_CANDLE = 8    # Kapanmış mumda en az 8 işlem
+MIN_PREVIOUS_BAR_VOLUME_RATIO = 0.5  # Önceki mum esnek hacim şartı
 
-# === TRAILING STOP AYARLARI ===
-TRAILING_ACTIVATION_PCT = 0.020   # %2 kârda trailing aktif olur
-TRAILING_STOP_PCT = 0.010         # %1 trailing mesafesi
+# === DENGELİ TRAILING STOP AYARLARI ===
+TRAILING_ACTIVATION_PCT = 0.010   # %1.0 kârda trailing aktifleşir
+TRAILING_STOP_PCT = 0.007         # Zirveden %0.7 geri çekilirse kârı kilitler
 
 API_ENDPOINTS = [
     "https://data-api.binance.vision",
@@ -117,7 +117,7 @@ class DualTradingBot:
     def __init__(self):
         self.balance = INITIAL_BALANCE
         self.positions = {}
-        print("=== YÜKSEK HACİMLİ DAY TRADE BOTU BAŞLATILDI ===")
+        print("=== DENGELİ DİNAMİK DAY TRADE BOTU BAŞLATILDI ===")
         print(f"Kasa: {self.balance:.2f} USDT | Min 24s Hacim: ${MIN_24H_VOLUME_USDT/1_000_000:.0f}M | Min 1m Hacim: ${MIN_1M_BAR_VOLUME_USDT:,}")
         print(f"Trailing: %{TRAILING_ACTIVATION_PCT*100} kârda aktif | Takip Mesafesi: %{TRAILING_STOP_PCT*100} | SL: %{STOP_LOSS_PCT*100}\n")
 
@@ -136,22 +136,27 @@ class DualTradingBot:
             previous_vol_usdt = closed_volumes[-2]
             avg_vol_usdt = sum(closed_volumes[-22:-2]) / 20
 
+            # 1. Hacim ve işlem sayısı taban kontrolleri
             if current_vol_usdt < MIN_1M_BAR_VOLUME_USDT:
                 return None, current_price
             if current_trade_count < MIN_TRADES_PER_1M_CANDLE:
                 return None, current_price
 
-            if avg_vol_usdt == 0 or (current_vol_usdt / avg_vol_usdt) < 4.0:
+            # 2. Hacim artış çarpanı (2.0x)
+            if avg_vol_usdt == 0 or (current_vol_usdt / avg_vol_usdt) < 2.0:
                 return None, current_price
 
+            # 3. Önceki mum kontrolü
             if previous_vol_usdt < avg_vol_usdt * MIN_PREVIOUS_BAR_VOLUME_RATIO:
                 return None, current_price
 
+            # 4. EMA50 trend göstergesi
             ema50 = calculate_ema(closed_closes, 50)
             if not ema50:
                 return None, current_price
             current_ema50 = ema50[-1]
 
+            # 5. MACD kesişim göstergesi
             macd_line, signal_line = calculate_macd(closed_closes)
             if not macd_line or len(macd_line) < 2:
                 return None, current_price
@@ -203,121 +208,3 @@ class DualTradingBot:
                         if current_price > pos['highest_price']:
                             pos['highest_price'] = current_price
                             pos['trailing_stop_price'] = current_price * (1 - TRAILING_STOP_PCT)
-                        if current_price <= pos['trailing_stop_price']:
-                            self.close_position(symbol, current_price, "TRAILING STOP")
-                            continue
-                    else:  # SHORT
-                        if current_price < pos['lowest_price']:
-                            pos['lowest_price'] = current_price
-                            pos['trailing_stop_price'] = current_price * (1 + TRAILING_STOP_PCT)
-                        if current_price >= pos['trailing_stop_price']:
-                            self.close_position(symbol, current_price, "TRAILING STOP")
-                            continue
-
-                # Normal TP / SL (Trailing aktifleşene kadar geçerli)
-                if not pos['trailing_activated']:
-                    if pnl_pct >= TAKE_PROFIT_PCT:
-                        self.close_position(symbol, current_price, "KÂR AL (TP)")
-                    elif pnl_pct <= -STOP_LOSS_PCT:
-                        self.close_position(symbol, current_price, "ZARAR DURDUR (SL)")
-
-            except Exception as e:
-                print(f"[HATA] Pozisyon takip hatası ({symbol}): {e}")
-
-    def open_position(self, symbol, side, price):
-        if len(self.positions) >= MAX_OPEN_POSITIONS or symbol in self.positions:
-            return
-
-        trade_amount = self.balance * TRADE_ALLOCATION_PCT
-        if trade_amount < 10.0:
-            return
-
-        commission = trade_amount * COMMISSION_RATE
-        self.balance -= (trade_amount + commission)
-        quantity = trade_amount / price
-
-        if side == "LONG":
-            tp_price = price * (1 + TAKE_PROFIT_PCT)
-            sl_price = price * (1 - STOP_LOSS_PCT)
-        else:
-            tp_price = price * (1 - TAKE_PROFIT_PCT)
-            sl_price = price * (1 + STOP_LOSS_PCT)
-
-        self.positions[symbol] = {
-            'side': side,
-            'entry_price': price,
-            'quantity': quantity,
-            'cost_usdt': trade_amount,
-            'tp_price': tp_price,
-            'sl_price': sl_price,
-            'timestamp': time.time(),
-            'entry_time': datetime.now().strftime("%H:%M:%S"),
-            'trailing_activated': False,
-            'trailing_stop_price': None,
-            'highest_price': price if side == "LONG" else None,
-            'lowest_price': price if side == "SHORT" else None
-        }
-
-        icon = "🟢 LONG" if side == "LONG" else "🔴 SHORT"
-        print(f"\n[POZİSYON AÇILDI] >> {icon} {symbol}")
-        print(f"  Giriş Fiyatı : ${price:.4f}")
-        print(f"  Tutar        : {trade_amount:.2f} USDT")
-        print(f"  Hedef TP     : ${tp_price:.4f}")
-        print(f"  Stop SL      : ${sl_price:.4f}")
-        print(f"  Kalan Bakiye : {self.balance:.2f} USDT\n")
-
-    def close_position(self, symbol, exit_price, reason):
-        pos = self.positions.pop(symbol)
-        side = pos['side']
-        entry_price = pos['entry_price']
-
-        if side == "LONG":
-            raw_pnl = pos['quantity'] * (exit_price - entry_price)
-        else:
-            raw_pnl = pos['quantity'] * (entry_price - exit_price)
-
-        exit_value = pos['cost_usdt'] + raw_pnl
-        commission = exit_value * COMMISSION_RATE
-        net_return = exit_value - commission
-        net_pnl = net_return - pos['cost_usdt']
-        pnl_pct = (net_pnl / pos['cost_usdt']) * 100
-
-        self.balance += net_return
-
-        print(f"\n[POZİSYON KAPATILDI] << {side} {symbol} ({reason})")
-        print(f"  Giriş / Çıkış: ${entry_price:.4f} -> ${exit_price:.4f}")
-        print(f"  Net K/Z      : {net_pnl:+.2f} USDT ({pnl_pct:+.2f}%)")
-        print(f"  Güncel Bakiye: {self.balance:.2f} USDT\n")
-
-    def run(self):
-        print("Piyasa taranıyor (Sadece aktif ve yüksek likiditeye sahip coinler izleniyor)...\n")
-        while True:
-            try:
-                if self.positions:
-                    self.check_open_positions()
-
-                if len(self.positions) < MAX_OPEN_POSITIONS:
-                    candidates = get_candidate_symbols()
-                    for sym in candidates:
-                        if sym in self.positions:
-                            continue
-                        side, price = self.analyze_symbol(sym)
-                        if side:
-                            self.open_position(sym, side, price)
-                            if len(self.positions) >= MAX_OPEN_POSITIONS:
-                                break
-                        time.sleep(0.05)
-
-                now = datetime.now().strftime("%H:%M:%S")
-                status = "[{}] Tarama tamamlandı. Açık: {}/{} | Bakiye: {:.2f} USDT".format(
-                    now, len(self.positions), MAX_OPEN_POSITIONS, self.balance
-                )
-                print(status)
-                time.sleep(SCAN_INTERVAL_SEC)
-
-            except Exception as e:
-                print(f"[DÖNGÜ HATASI]: {e}")
-                time.sleep(SCAN_INTERVAL_SEC)
-
-bot = DualTradingBot()
-bot.run()
