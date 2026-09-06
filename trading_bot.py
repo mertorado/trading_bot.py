@@ -12,9 +12,7 @@ from flask import Flask, jsonify, render_template_string
 # AYARLAR
 # ============================================================
 
-MARKET_DATA_BASE_URL = (
-    "https://api.exchange.coinbase.com"
-)
+MARKET_DATA_BASE_URL = "https://api.exchange.coinbase.com"
 
 TIMEFRAME = "3m"
 COINBASE_GRANULARITY_SECONDS = 60
@@ -23,14 +21,11 @@ RESAMPLE_MINUTES = 3
 SCAN_INTERVAL_SECONDS = 20
 
 INITIAL_BALANCE = 1000.0
+
+# İşlem başına maksimum allocation (%10)
 TRADE_SIZE_PERCENT = 0.10
+
 MAX_OPEN_POSITIONS = 10
-
-TAKE_PROFIT_PCT = 0.025
-STOP_LOSS_PCT = 0.015
-
-TRAILING_TRIGGER_PCT = 0.012
-TRAILING_DISTANCE_PCT = 0.006
 
 # Alış ve satışta simüle edilen komisyon oranı
 # 0.001 = %0.10
@@ -48,6 +43,33 @@ MIN_PRICE = 0.05
 MAX_PRICE = 100.0
 
 MAX_SYMBOLS_TO_SCAN = 40
+
+
+# ============================================================
+# ATR BAZLI DİNAMİK RİSK SİSTEMİ
+# ============================================================
+
+# Her işlemde hesabın yalnızca %0.5'i riske girer
+RISK_PER_TRADE_PCT = 0.005
+
+# ATR hesaplama periyodu (tamamlanmış mumlar üzerinde)
+ATR_PERIOD = 14
+
+# Stop mesafesi = ATR × ATR_STOP_MULTIPLIER
+ATR_STOP_MULTIPLIER = 1.5
+
+# Take-profit mesafesi = stop mesafesi × RISK_REWARD_RATIO
+RISK_REWARD_RATIO = 1.8
+
+# Trailing stop, kâr bu R katına ulaşınca aktifleşir
+TRAILING_TRIGGER_R_MULTIPLE = 1.0
+
+# Trailing stop mesafesi (R cinsinden)
+TRAILING_DISTANCE_R_MULTIPLE = 0.75
+
+# Stop mesafesi yüzde olarak bu sınırlar arasında tutulur
+MIN_STOP_DISTANCE_PCT = 0.006
+MAX_STOP_DISTANCE_PCT = 0.030
 
 
 # ============================================================
@@ -222,6 +244,7 @@ def strategy_summary(strategy):
     }
 
 
+
 # ============================================================
 # COINBASE PİYASA VERİSİ
 # ============================================================
@@ -268,13 +291,8 @@ def get_top_symbols():
 
                 ticker = ticker_response.json()
 
-                price = safe_float(
-                    ticker.get("price")
-                )
-
-                base_volume = safe_float(
-                    ticker.get("volume")
-                )
+                price = safe_float(ticker.get("price"))
+                base_volume = safe_float(ticker.get("volume"))
 
                 if price <= 0 or base_volume <= 0:
                     continue
@@ -287,9 +305,7 @@ def get_top_symbols():
                 if not MIN_PRICE <= price <= MAX_PRICE:
                     continue
 
-                candidates.append(
-                    (symbol, volume_usd)
-                )
+                candidates.append((symbol, volume_usd))
 
             except requests.exceptions.RequestException:
                 continue
@@ -304,53 +320,40 @@ def get_top_symbols():
 
         symbols = [
             symbol
-            for symbol, volume in candidates[
-                :MAX_SYMBOLS_TO_SCAN
-            ]
+            for symbol, volume in candidates[:MAX_SYMBOLS_TO_SCAN]
         ]
 
-        print(
-            f"[+] {len(symbols)} Coinbase aday sembol bulundu"
-        )
+        print(f"[+] {len(symbols)} Coinbase aday sembol bulundu")
 
         return symbols
 
     except requests.exceptions.HTTPError as error:
-        print(
-            f"[!] Coinbase ürün API HTTP hatası: {error}"
-        )
+        print(f"[!] Coinbase ürün API HTTP hatası: {error}")
 
         try:
-            print(
-                f"[!] API cevabı: {response.text[:300]}"
-            )
+            print(f"[!] API cevabı: {response.text[:300]}")
         except Exception:
             pass
 
         return []
 
     except requests.exceptions.RequestException as error:
-        print(
-            f"[!] Coinbase bağlantı hatası: {error}"
-        )
+        print(f"[!] Coinbase bağlantı hatası: {error}")
         return []
 
     except ValueError as error:
-        print(
-            f"[!] Coinbase JSON hatası: {error}"
-        )
+        print(f"[!] Coinbase JSON hatası: {error}")
         return []
 
     except Exception as error:
-        print(
-            f"[!] Sembol listesi hatası: {error}"
-        )
+        print(f"[!] Sembol listesi hatası: {error}")
         return []
 
 
 def get_klines_data(symbol, resample_minutes=3):
     """
-    Coinbase'den 1 dakikalık mumları alır.
+    Coinbase'den 1 dakikalık mumları alır ve istenen zaman
+    dilimine yeniden örnekler.
 
     resample_minutes=3:
         Ana strateji için 3 dakikalık mumlar
@@ -361,6 +364,13 @@ def get_klines_data(symbol, resample_minutes=3):
     Coinbase candle formatı:
 
     [timestamp, low, high, open, close, volume]
+
+    Coinbase mumları en yeni mum ilk sırada olacak şekilde
+    döner; bu yüzden veriler datetime'a göre artan sıraya
+    getirilir. Sinyal ve pozisyon yönetimi her zaman
+    tamamlanmış mumlar (iloc[-2] ve öncesi) üzerinden yapılır;
+    en son satır (iloc[-1]) henüz açık olan mumdur ve
+    kullanılmaz.
     """
 
     url = (
@@ -416,9 +426,8 @@ def get_klines_data(symbol, resample_minutes=3):
             utc=True
         )
 
-        dataframe = dataframe.sort_values(
-            "datetime"
-        )
+        # Coinbase mumları en yeni önce döner; artan sıraya al.
+        dataframe = dataframe.sort_values("datetime")
 
         dataframe = dataframe.drop_duplicates(
             subset=["datetime"]
@@ -442,36 +451,28 @@ def get_klines_data(symbol, resample_minutes=3):
 
         dataframe = dataframe.dropna().reset_index()
 
-        minimum_rows = (
-            65
-            if resample_minutes == 3
-            else 25
-        )
+        minimum_rows = 65 if resample_minutes == 3 else 25
 
         if len(dataframe) < minimum_rows:
             return None
 
         dataframe["open_time"] = (
-            dataframe["datetime"].astype("int64")
-            // 10**9
+            dataframe["datetime"].astype("int64") // 10**9
         )
 
         dataframe["close_time"] = (
-            dataframe["open_time"]
-            + (resample_minutes * 60)
+            dataframe["open_time"] + (resample_minutes * 60)
         )
 
         dataframe["quote_volume"] = (
-            dataframe["close"]
-            * dataframe["volume"]
+            dataframe["close"] * dataframe["volume"]
         )
 
         return dataframe
 
     except requests.exceptions.HTTPError as error:
         print(
-            f"[!] Coinbase mum HTTP hatası "
-            f"{symbol}: {error}"
+            f"[!] Coinbase mum HTTP hatası {symbol}: {error}"
         )
         return None
 
@@ -482,15 +483,77 @@ def get_klines_data(symbol, resample_minutes=3):
         return None
 
     except Exception as error:
-        print(
-            f"[!] Mum verisi hatası {symbol}: {error}"
-        )
+        print(f"[!] Mum verisi hatası {symbol}: {error}")
         return None
+
 
 
 # ============================================================
 # TEKNİK İNDİKATÖRLER
 # ============================================================
+
+def calculate_atr(dataframe, period=ATR_PERIOD):
+    """
+    Wilder'ın ATR (Average True Range) hesaplaması.
+
+    True Range = max(
+        high - low,
+        abs(high - önceki close),
+        abs(low - önceki close)
+    )
+
+    ATR, True Range'in Wilder yumuşatmasıyla (alpha = 1/period)
+    üstel hareketli ortalamasıdır. Sonuç dataframe'e "atr"
+    kolonu olarak eklenir.
+    """
+
+    dataframe = dataframe.copy()
+
+    high = dataframe["high"]
+    low = dataframe["low"]
+    close = dataframe["close"]
+
+    previous_close = close.shift(1)
+
+    high_low = high - low
+    high_close = (high - previous_close).abs()
+    low_close = (low - previous_close).abs()
+
+    true_range = pd.concat(
+        [high_low, high_close, low_close],
+        axis=1
+    ).max(axis=1)
+
+    # Wilder yumuşatması: alpha = 1 / period
+    dataframe["atr"] = true_range.ewm(
+        alpha=1.0 / period,
+        adjust=False,
+        min_periods=period
+    ).mean()
+
+    return dataframe
+
+
+def get_completed_atr(dataframe, period=ATR_PERIOD):
+    """
+    Tamamlanmış son mumun (iloc[-2]) ATR değerini döndürür.
+
+    Açık olan son mum (iloc[-1]) kullanılmaz. Geçerli bir ATR
+    yoksa None döner.
+    """
+
+    if dataframe is None or len(dataframe) < period + 2:
+        return None
+
+    atr_frame = calculate_atr(dataframe, period)
+
+    atr_value = safe_float(atr_frame.iloc[-2]["atr"])
+
+    if pd.isna(atr_value) or atr_value <= 0:
+        return None
+
+    return atr_value
+
 
 def calculate_indicators(dataframe):
     dataframe = dataframe.copy()
@@ -502,15 +565,8 @@ def calculate_indicators(dataframe):
         adjust=False
     ).mean()
 
-    ema_12 = close.ewm(
-        span=12,
-        adjust=False
-    ).mean()
-
-    ema_26 = close.ewm(
-        span=26,
-        adjust=False
-    ).mean()
+    ema_12 = close.ewm(span=12, adjust=False).mean()
+    ema_26 = close.ewm(span=26, adjust=False).mean()
 
     dataframe["macd"] = ema_12 - ema_26
 
@@ -521,30 +577,17 @@ def calculate_indicators(dataframe):
 
     price_change = close.diff()
 
-    gains = price_change.where(
-        price_change > 0,
-        0
-    )
-
-    losses = -price_change.where(
-        price_change < 0,
-        0
-    )
+    gains = price_change.where(price_change > 0, 0)
+    losses = -price_change.where(price_change < 0, 0)
 
     average_gain = gains.rolling(14).mean()
     average_loss = losses.rolling(14).mean()
 
-    relative_strength = average_gain / (
-        average_loss + 1e-9
-    )
+    relative_strength = average_gain / (average_loss + 1e-9)
 
-    dataframe["rsi"] = 100 - (
-        100 / (1 + relative_strength)
-    )
+    dataframe["rsi"] = 100 - (100 / (1 + relative_strength))
 
-    dataframe["volume_ma"] = dataframe["volume"].rolling(
-        20
-    ).mean()
+    dataframe["volume_ma"] = dataframe["volume"].rolling(20).mean()
 
     return dataframe
 
@@ -553,7 +596,8 @@ def analyze_signal(dataframe):
     """
     Ana 3 dakikalık strateji.
 
-    Sadece tamamlanmış mumlar kullanılır.
+    Sadece tamamlanmış mumlar kullanılır (iloc[-2] güncel
+    tamamlanmış mum, iloc[-3] bir önceki tamamlanmış mum).
     """
 
     if dataframe is None or len(dataframe) < 60:
@@ -582,17 +626,13 @@ def analyze_signal(dataframe):
 
     volume_is_strong = (
         current_candle["volume"]
-        >= current_candle["volume_ma"]
-        * VOLUME_SPIKE_FACTOR
+        >= current_candle["volume_ma"] * VOLUME_SPIKE_FACTOR
     )
 
     long_signal = (
-        current_candle["close"]
-        > current_candle["ema_50"]
-        and previous_candle["macd"]
-        <= previous_candle["macd_signal"]
-        and current_candle["macd"]
-        > current_candle["macd_signal"]
+        current_candle["close"] > current_candle["ema_50"]
+        and previous_candle["macd"] <= previous_candle["macd_signal"]
+        and current_candle["macd"] > current_candle["macd_signal"]
         and 40 <= current_candle["rsi"] <= 65
         and volume_is_strong
     )
@@ -601,12 +641,9 @@ def analyze_signal(dataframe):
         return "LONG"
 
     short_signal = (
-        current_candle["close"]
-        < current_candle["ema_50"]
-        and previous_candle["macd"]
-        >= previous_candle["macd_signal"]
-        and current_candle["macd"]
-        < current_candle["macd_signal"]
+        current_candle["close"] < current_candle["ema_50"]
+        and previous_candle["macd"] >= previous_candle["macd_signal"]
+        and current_candle["macd"] < current_candle["macd_signal"]
         and 35 <= current_candle["rsi"] <= 60
         and volume_is_strong
     )
@@ -636,9 +673,7 @@ def analyze_momentum_signal(dataframe_1m, dataframe_3m):
     if len(dataframe_3m) < 60:
         return None
 
-    trend_data = calculate_indicators(
-        dataframe_3m
-    )
+    trend_data = calculate_indicators(dataframe_3m)
 
     momentum_data = dataframe_1m.copy()
 
@@ -649,13 +684,9 @@ def analyze_momentum_signal(dataframe_1m, dataframe_3m):
     trend_candle = trend_data.iloc[-2]
     current_candle = momentum_data.iloc[-2]
 
-    lookback_start = -(
-        MOMENTUM_BREAKOUT_LOOKBACK + 2
-    )
+    lookback_start = -(MOMENTUM_BREAKOUT_LOOKBACK + 2)
 
-    previous_candles = momentum_data.iloc[
-        lookback_start:-2
-    ]
+    previous_candles = momentum_data.iloc[lookback_start:-2]
 
     required_values = [
         trend_candle["close"],
@@ -676,29 +707,13 @@ def analyze_momentum_signal(dataframe_1m, dataframe_3m):
     if previous_candles.empty:
         return None
 
-    previous_high = safe_float(
-        previous_candles["high"].max()
-    )
+    previous_high = safe_float(previous_candles["high"].max())
+    previous_low = safe_float(previous_candles["low"].min())
 
-    previous_low = safe_float(
-        previous_candles["low"].min()
-    )
-
-    current_open = safe_float(
-        current_candle["open"]
-    )
-
-    current_close = safe_float(
-        current_candle["close"]
-    )
-
-    current_volume = safe_float(
-        current_candle["volume"]
-    )
-
-    volume_average = safe_float(
-        current_candle["volume_ma"]
-    )
+    current_open = safe_float(current_candle["open"])
+    current_close = safe_float(current_candle["close"])
+    current_volume = safe_float(current_candle["volume"])
+    volume_average = safe_float(current_candle["volume_ma"])
 
     if (
         previous_high <= 0
@@ -709,22 +724,17 @@ def analyze_momentum_signal(dataframe_1m, dataframe_3m):
 
     volume_is_strong = (
         current_volume
-        >= volume_average
-        * MOMENTUM_VOLUME_SPIKE_FACTOR
+        >= volume_average * MOMENTUM_VOLUME_SPIKE_FACTOR
     )
 
     long_trend = (
-        trend_candle["close"]
-        > trend_candle["ema_50"]
-        and trend_candle["macd"]
-        > trend_candle["macd_signal"]
+        trend_candle["close"] > trend_candle["ema_50"]
+        and trend_candle["macd"] > trend_candle["macd_signal"]
     )
 
     short_trend = (
-        trend_candle["close"]
-        < trend_candle["ema_50"]
-        and trend_candle["macd"]
-        < trend_candle["macd_signal"]
+        trend_candle["close"] < trend_candle["ema_50"]
+        and trend_candle["macd"] < trend_candle["macd_signal"]
     )
 
     long_breakout = (
@@ -753,18 +763,10 @@ def analyze_momentum_signal(dataframe_1m, dataframe_3m):
         if extension_pct > MOMENTUM_MAX_EXTENSION_PCT:
             short_breakout = False
 
-    if (
-        long_trend
-        and long_breakout
-        and volume_is_strong
-    ):
+    if long_trend and long_breakout and volume_is_strong:
         return "LONG"
 
-    if (
-        short_trend
-        and short_breakout
-        and volume_is_strong
-    ):
+    if short_trend and short_breakout and volume_is_strong:
         return "SHORT"
 
     return None
@@ -778,16 +780,10 @@ def can_open_new_trade(symbol):
     now = time.time()
 
     with state_lock:
-        cooldown_until = symbol_cooldowns.get(
-            symbol,
-            0
-        )
+        cooldown_until = symbol_cooldowns.get(symbol, 0)
 
         if now < cooldown_until:
-            return (
-                False,
-                "Coin soğuma süresinde"
-            )
+            return False, "Coin soğuma süresinde"
 
         one_hour_ago = now - 3600
         one_day_ago = now - 86400
@@ -803,24 +799,83 @@ def can_open_new_trade(symbol):
         )
 
         if hourly_count >= MAX_TRADES_PER_HOUR:
-            return (
-                False,
-                "Saatlik işlem limiti"
-            )
+            return False, "Saatlik işlem limiti"
 
         if daily_count >= MAX_TRADES_PER_DAY:
-            return (
-                False,
-                "Günlük işlem limiti"
-            )
+            return False, "Günlük işlem limiti"
 
         if len(open_positions) >= MAX_OPEN_POSITIONS:
-            return (
-                False,
-                "Açık pozisyon limiti"
-            )
+            return False, "Açık pozisyon limiti"
 
         return True, "OK"
+
+
+
+# ============================================================
+# ATR BAZLI POZİSYON BÜYÜKLÜĞÜ VE RİSK HESABI
+# ============================================================
+
+def compute_risk_parameters(side, price, atr_value, current_balance):
+    """
+    ATR bazlı dinamik risk hesaplaması.
+
+    Adımlar:
+      1. Stop mesafesi = ATR × ATR_STOP_MULTIPLIER
+      2. Stop mesafesi yüzde olarak MIN_STOP_DISTANCE_PCT ve
+         MAX_STOP_DISTANCE_PCT arasında sınırlandırılır.
+      3. Long / short'a göre stop_loss ve take_profit belirlenir.
+         take_profit mesafesi = stop mesafesi × RISK_REWARD_RATIO
+      4. Pozisyon büyüklüğü, hesabın yalnızca
+         RISK_PER_TRADE_PCT (%0.5) kadarı riske girecek şekilde
+         hesaplanır: trade_amount = risk_tutarı / stop_mesafesi_yüzdesi
+      5. Pozisyon büyüklüğü %10 allocation sınırını (TRADE_SIZE_PERCENT)
+         aşamaz.
+
+    Geçersiz girdi durumunda None döner.
+    """
+
+    if price <= 0 or atr_value <= 0 or current_balance <= 0:
+        return None
+
+    # 1) ATR bazlı ham stop mesafesi (fiyat cinsinden)
+    raw_stop_distance = atr_value * ATR_STOP_MULTIPLIER
+
+    # 2) Yüzdeye çevir ve sınırlar arasında tut
+    stop_distance_pct = raw_stop_distance / price
+
+    stop_distance_pct = max(
+        MIN_STOP_DISTANCE_PCT,
+        min(stop_distance_pct, MAX_STOP_DISTANCE_PCT)
+    )
+
+    stop_distance = price * stop_distance_pct
+
+    # 3) Long / short'a göre stop ve hedef
+    take_profit_distance = stop_distance * RISK_REWARD_RATIO
+
+    if side == "LONG":
+        stop_loss = price - stop_distance
+        take_profit = price + take_profit_distance
+    else:
+        stop_loss = price + stop_distance
+        take_profit = price - take_profit_distance
+
+    # 4) Sadece hesabın %0.5'i riske girecek şekilde büyüklük
+    risk_amount = current_balance * RISK_PER_TRADE_PCT
+    trade_amount = risk_amount / stop_distance_pct
+
+    # 5) %10 allocation sınırı
+    max_allocation = current_balance * TRADE_SIZE_PERCENT
+    trade_amount = min(trade_amount, max_allocation)
+
+    return {
+        "stop_distance": stop_distance,
+        "stop_distance_pct": stop_distance_pct,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "risk_amount": risk_amount,
+        "trade_amount": trade_amount,
+    }
 
 
 # ============================================================
@@ -832,6 +887,7 @@ def execute_trade(
     side,
     price,
     entry_candle_time,
+    atr_value,
     strategy="NORMAL"
 ):
     global balance
@@ -852,45 +908,41 @@ def execute_trade(
             if momentum_count >= MAX_MOMENTUM_POSITIONS:
                 return False
 
-        trade_amount = balance * TRADE_SIZE_PERCENT
+        if atr_value is None or atr_value <= 0:
+            print(f"[!] {symbol} için geçerli ATR yok, işlem atlandı")
+            return False
+
+        risk = compute_risk_parameters(
+            side,
+            price,
+            atr_value,
+            balance
+        )
+
+        if risk is None:
+            print(f"[!] {symbol} için risk parametreleri hesaplanamadı")
+            return False
+
+        trade_amount = risk["trade_amount"]
 
         if trade_amount < 10:
-            print(
-                "[!] İşlem tutarı 10 USDT altında"
-            )
+            print("[!] İşlem tutarı 10 USDT altında")
             return False
 
         entry_fee = trade_amount * COMMISSION_RATE
 
         if balance < trade_amount + entry_fee:
-            print(
-                "[!] Yeterli paper trading bakiyesi yok"
-            )
+            print("[!] Yeterli paper trading bakiyesi yok")
             return False
 
-        if side == "LONG":
-            take_profit = price * (
-                1 + TAKE_PROFIT_PCT
-            )
-
-            stop_loss = price * (
-                1 - STOP_LOSS_PCT
-            )
-
-        else:
-            take_profit = price * (
-                1 - TAKE_PROFIT_PCT
-            )
-
-            stop_loss = price * (
-                1 + STOP_LOSS_PCT
-            )
+        stop_loss = risk["stop_loss"]
+        take_profit = risk["take_profit"]
+        stop_distance = risk["stop_distance"]
+        stop_distance_pct = risk["stop_distance_pct"]
 
         balance -= trade_amount + entry_fee
 
-        entry_time = candle_time_string(
-            entry_candle_time
-        )
+        entry_time = candle_time_string(entry_candle_time)
 
         open_positions[symbol] = {
             "symbol": symbol,
@@ -899,6 +951,9 @@ def execute_trade(
             "entry_price": price,
             "amount": trade_amount,
             "entry_fee": entry_fee,
+            "atr": atr_value,
+            "stop_distance": stop_distance,
+            "stop_distance_pct": stop_distance_pct,
             "take_profit": take_profit,
             "stop_loss": stop_loss,
             "peak_price": price,
@@ -913,66 +968,50 @@ def execute_trade(
             "post_entry_low_time": entry_time,
         }
 
-        trade_history_timestamps.append(
-            time.time()
-        )
+        trade_history_timestamps.append(time.time())
+
+        risk_amount = risk["risk_amount"]
 
         print()
+        print(f"[POZİSYON AÇILDI] {strategy} {side} {symbol}")
+        print(f"  Strateji         : {strategy}")
+        print(f"  Giriş fiyatı     : ${price:.8f}")
+        print(f"  ATR              : {atr_value:.8f}")
         print(
-            f"[POZİSYON AÇILDI] "
-            f"{strategy} {side} {symbol}"
+            f"  Stop mesafesi    : ${stop_distance:.8f} "
+            f"(%{stop_distance_pct * 100:.3f})"
         )
+        print(f"  İşlem tutarı     : {trade_amount:.2f} USDT")
         print(
-            f"  Strateji       : {strategy}"
+            f"  Riske edilen     : {risk_amount:.4f} USDT "
+            f"(%{RISK_PER_TRADE_PCT * 100:.2f})"
         )
-        print(
-            f"  Giriş fiyatı   : ${price:.8f}"
-        )
-        print(
-            f"  İşlem tutarı   : {trade_amount:.2f} USDT"
-        )
-        print(
-            f"  TP             : ${take_profit:.8f}"
-        )
-        print(
-            f"  SL             : ${stop_loss:.8f}"
-        )
-        print(
-            f"  Kalan bakiye   : {balance:.2f} USDT"
-        )
+        print(f"  TP (1R x {RISK_REWARD_RATIO}) : ${take_profit:.8f}")
+        print(f"  SL               : ${stop_loss:.8f}")
+        print(f"  Kalan bakiye     : {balance:.2f} USDT")
         print()
 
         return True
+
 
 
 # ============================================================
 # POZİSYON YÖNETİMİ
 # ============================================================
 
-def calculate_unrealized_pnl(
-    position,
-    current_price
-):
+def calculate_unrealized_pnl(position, current_price):
     entry_price = position["entry_price"]
     amount = position["amount"]
     side = position["side"]
 
     if side == "LONG":
-        gross_value = amount * (
-            current_price / entry_price
-        )
-
+        gross_value = amount * (current_price / entry_price)
     else:
         gross_value = amount * (
-            1
-            + (
-                entry_price - current_price
-            ) / entry_price
+            1 + (entry_price - current_price) / entry_price
         )
 
-    estimated_exit_fee = (
-        gross_value * COMMISSION_RATE
-    )
+    estimated_exit_fee = gross_value * COMMISSION_RATE
 
     return (
         gross_value
@@ -982,12 +1021,7 @@ def calculate_unrealized_pnl(
     )
 
 
-def close_position(
-    symbol,
-    position,
-    exit_price,
-    exit_reason
-):
+def close_position(symbol, position, exit_price, exit_reason):
     global balance
 
     entry_price = position["entry_price"]
@@ -996,47 +1030,27 @@ def close_position(
     side = position["side"]
 
     if side == "LONG":
-        gross_return = amount * (
-            exit_price / entry_price
-        )
-
+        gross_return = amount * (exit_price / entry_price)
     else:
         gross_return = amount * (
-            1
-            + (
-                entry_price - exit_price
-            ) / entry_price
+            1 + (entry_price - exit_price) / entry_price
         )
 
     exit_fee = gross_return * COMMISSION_RATE
     net_return = gross_return - exit_fee
 
-    total_pnl = (
-        net_return
-        - amount
-        - entry_fee
-    )
+    total_pnl = net_return - amount - entry_fee
 
     balance += net_return
 
     symbol_cooldowns[symbol] = (
-        time.time()
-        + SYMBOL_COOLDOWN_SECONDS
+        time.time() + SYMBOL_COOLDOWN_SECONDS
     )
 
-    pnl_percent = (
-        total_pnl / amount
-    ) * 100
+    pnl_percent = (total_pnl / amount) * 100
 
-    post_entry_high = position.get(
-        "post_entry_high",
-        entry_price
-    )
-
-    post_entry_low = position.get(
-        "post_entry_low",
-        entry_price
-    )
+    post_entry_high = position.get("post_entry_high", entry_price)
+    post_entry_low = position.get("post_entry_low", entry_price)
 
     high_time = position.get(
         "post_entry_high_time",
@@ -1060,42 +1074,22 @@ def close_position(
 
     if side == "LONG":
         max_favorable_move_pct = (
-            (
-                post_entry_high
-                - entry_price
-            )
-            / entry_price
+            (post_entry_high - entry_price) / entry_price
         ) * 100
 
         max_adverse_move_pct = (
-            (
-                post_entry_low
-                - entry_price
-            )
-            / entry_price
+            (post_entry_low - entry_price) / entry_price
         ) * 100
-
     else:
         max_favorable_move_pct = (
-            (
-                entry_price
-                - post_entry_low
-            )
-            / entry_price
+            (entry_price - post_entry_low) / entry_price
         ) * 100
 
         max_adverse_move_pct = (
-            (
-                entry_price
-                - post_entry_high
-            )
-            / entry_price
+            (entry_price - post_entry_high) / entry_price
         ) * 100
 
-    strategy = position.get(
-        "strategy",
-        "NORMAL"
-    )
+    strategy = position.get("strategy", "NORMAL")
 
     trade_entry = {
         "symbol": symbol,
@@ -1107,24 +1101,12 @@ def close_position(
         "pnl": round(total_pnl, 4),
         "pnl_pct": round(pnl_percent, 4),
         "time": utc_time_string(),
-        "post_entry_high": round(
-            post_entry_high,
-            8
-        ),
-        "post_entry_low": round(
-            post_entry_low,
-            8
-        ),
+        "post_entry_high": round(post_entry_high, 8),
+        "post_entry_low": round(post_entry_low, 8),
         "post_entry_high_time": high_time,
         "post_entry_low_time": low_time,
-        "max_favorable_move_pct": round(
-            max_favorable_move_pct,
-            4
-        ),
-        "max_adverse_move_pct": round(
-            max_adverse_move_pct,
-            4
-        ),
+        "max_favorable_move_pct": round(max_favorable_move_pct, 4),
+        "max_adverse_move_pct": round(max_adverse_move_pct, 4),
     }
 
     trade_log.insert(0, trade_entry)
@@ -1137,50 +1119,23 @@ def close_position(
         f"[POZİSYON KAPATILDI] "
         f"{result} {strategy} {side} {symbol}"
     )
-    print(
-        f"  Strateji             : {strategy}"
-    )
-    print(
-        f"  Sebep                : {exit_reason}"
-    )
+    print(f"  Strateji             : {strategy}")
+    print(f"  Sebep                : {exit_reason}")
     print(
         f"  Giriş/Çıkış          : "
-        f"${entry_price:.8f} -> "
-        f"${exit_price:.8f}"
+        f"${entry_price:.8f} -> ${exit_price:.8f}"
     )
     print(
         f"  Net K/Z              : "
-        f"{total_pnl:+.4f} USDT "
-        f"({pnl_percent:+.4f}%)"
+        f"{total_pnl:+.4f} USDT ({pnl_percent:+.4f}%)"
     )
-    print(
-        f"  Güncel bakiye        : "
-        f"{balance:.4f} USDT"
-    )
-    print(
-        f"  İşlem sonrası tavan  : "
-        f"${post_entry_high:.8f}"
-    )
-    print(
-        f"  Tavan zamanı         : "
-        f"{high_time}"
-    )
-    print(
-        f"  İşlem sonrası taban  : "
-        f"${post_entry_low:.8f}"
-    )
-    print(
-        f"  Taban zamanı         : "
-        f"{low_time}"
-    )
-    print(
-        f"  Maks. olumlu hareket: "
-        f"{max_favorable_move_pct:+.4f}%"
-    )
-    print(
-        f"  Maks. ters hareket   : "
-        f"{max_adverse_move_pct:+.4f}%"
-    )
+    print(f"  Güncel bakiye        : {balance:.4f} USDT")
+    print(f"  İşlem sonrası tavan  : ${post_entry_high:.8f}")
+    print(f"  Tavan zamanı         : {high_time}")
+    print(f"  İşlem sonrası taban  : ${post_entry_low:.8f}")
+    print(f"  Taban zamanı         : {low_time}")
+    print(f"  Maks. olumlu hareket : {max_favorable_move_pct:+.4f}%")
+    print(f"  Maks. ters hareket   : {max_adverse_move_pct:+.4f}%")
     print()
 
 
@@ -1204,32 +1159,37 @@ def update_position_extremes(
 
 
 def manage_positions():
+    """
+    Açık pozisyonları tamamlanmış 3 dakikalık mumlarla yönetir.
+
+    Çıkış öncelik sırası (aynı mumda birden fazla seviye
+    görülürse STOP önceliklidir):
+      1. Trailing stop (aktifse)
+      2. Stop loss
+      3. Take profit
+
+    Trailing stop, R-multiple (yüzde değil) ile çalışır:
+      - R = giriş anındaki stop mesafesi (fiyat cinsinden)
+      - Kâr TRAILING_TRIGGER_R_MULTIPLE (1R) katına ulaşınca
+        trailing aktifleşir.
+      - Trailing mesafesi TRAILING_DISTANCE_R_MULTIPLE (0.75R)'dir.
+    """
+
     with state_lock:
         symbols = list(open_positions.keys())
 
     for symbol in symbols:
-        dataframe = get_klines_data(
-            symbol,
-            resample_minutes=3
-        )
+        dataframe = get_klines_data(symbol, resample_minutes=3)
 
         if dataframe is None or len(dataframe) < 2:
             continue
 
+        # Sadece tamamlanmış mum (iloc[-2]); iloc[-1] açık mum.
         completed_candle = dataframe.iloc[-2]
 
-        current_price = safe_float(
-            completed_candle["close"]
-        )
-
-        candle_high = safe_float(
-            completed_candle["high"]
-        )
-
-        candle_low = safe_float(
-            completed_candle["low"]
-        )
-
+        current_price = safe_float(completed_candle["close"])
+        candle_high = safe_float(completed_candle["high"])
+        candle_low = safe_float(completed_candle["low"])
         candle_time = completed_candle["datetime"]
 
         if current_price <= 0:
@@ -1243,20 +1203,16 @@ def manage_positions():
 
             side = position["side"]
             entry_price = position["entry_price"]
+            stop_distance = position["stop_distance"]
 
             position["last_price"] = current_price
 
             position["unrealized_pnl"] = round(
-                calculate_unrealized_pnl(
-                    position,
-                    current_price
-                ),
+                calculate_unrealized_pnl(position, current_price),
                 4
             )
 
-            entry_time = position.get(
-                "entry_candle_time"
-            )
+            entry_time = position.get("entry_candle_time")
 
             try:
                 update_extremes = (
@@ -1277,6 +1233,14 @@ def manage_positions():
             exit_reason = None
             exit_price = current_price
 
+            trailing_distance = (
+                stop_distance * TRAILING_DISTANCE_R_MULTIPLE
+            )
+
+            trailing_trigger = (
+                stop_distance * TRAILING_TRIGGER_R_MULTIPLE
+            )
+
             if side == "LONG":
                 if update_extremes:
                     position["peak_price"] = max(
@@ -1285,36 +1249,30 @@ def manage_positions():
                     )
 
                 profit_from_entry = (
-                    position["peak_price"]
-                    - entry_price
-                ) / entry_price
+                    position["peak_price"] - entry_price
+                )
 
-                if (
-                    profit_from_entry
-                    >= TRAILING_TRIGGER_PCT
-                ):
+                # 1R kâr görüldüğünde trailing aktifleşir
+                if profit_from_entry >= trailing_trigger:
                     position["trailing_active"] = True
 
+                # Stop önceliği: önce trailing, sonra stop, en son TP
                 if position["trailing_active"]:
                     trailing_stop = (
-                        position["peak_price"]
-                        * (
-                            1
-                            - TRAILING_DISTANCE_PCT
-                        )
+                        position["peak_price"] - trailing_distance
                     )
 
                     if candle_low <= trailing_stop:
                         exit_reason = "TRAILING STOP"
                         exit_price = trailing_stop
 
-                elif candle_low <= position["stop_loss"]:
-                    exit_reason = "STOP LOSS"
-                    exit_price = position["stop_loss"]
-
-                elif candle_high >= position["take_profit"]:
-                    exit_reason = "TAKE PROFIT"
-                    exit_price = position["take_profit"]
+                if exit_reason is None:
+                    if candle_low <= position["stop_loss"]:
+                        exit_reason = "STOP LOSS"
+                        exit_price = position["stop_loss"]
+                    elif candle_high >= position["take_profit"]:
+                        exit_reason = "TAKE PROFIT"
+                        exit_price = position["take_profit"]
 
             else:
                 if update_extremes:
@@ -1324,36 +1282,30 @@ def manage_positions():
                     )
 
                 profit_from_entry = (
-                    entry_price
-                    - position["peak_price"]
-                ) / entry_price
+                    entry_price - position["peak_price"]
+                )
 
-                if (
-                    profit_from_entry
-                    >= TRAILING_TRIGGER_PCT
-                ):
+                # 1R kâr görüldüğünde trailing aktifleşir
+                if profit_from_entry >= trailing_trigger:
                     position["trailing_active"] = True
 
+                # Stop önceliği: önce trailing, sonra stop, en son TP
                 if position["trailing_active"]:
                     trailing_stop = (
-                        position["peak_price"]
-                        * (
-                            1
-                            + TRAILING_DISTANCE_PCT
-                        )
+                        position["peak_price"] + trailing_distance
                     )
 
                     if candle_high >= trailing_stop:
                         exit_reason = "TRAILING STOP"
                         exit_price = trailing_stop
 
-                elif candle_high >= position["stop_loss"]:
-                    exit_reason = "STOP LOSS"
-                    exit_price = position["stop_loss"]
-
-                elif candle_low <= position["take_profit"]:
-                    exit_reason = "TAKE PROFIT"
-                    exit_price = position["take_profit"]
+                if exit_reason is None:
+                    if candle_high >= position["stop_loss"]:
+                        exit_reason = "STOP LOSS"
+                        exit_price = position["stop_loss"]
+                    elif candle_low <= position["take_profit"]:
+                        exit_reason = "TAKE PROFIT"
+                        exit_price = position["take_profit"]
 
             if exit_reason is not None:
                 # Çıkış fiyatını kapatmadan önce ekstrem değerlere
@@ -1378,6 +1330,7 @@ def manage_positions():
                 )
 
                 del open_positions[symbol]
+
 
 
 # ============================================================
@@ -1545,7 +1498,8 @@ DASHBOARD_HTML = """
         Veri kaynağı: Coinbase public market data |
         İşlemler sanal |
         Ana strateji: 3 dakika |
-        Momentum: 1 dakika
+        Momentum: 1 dakika |
+        Risk sistemi: ATR bazlı dinamik
     </div>
 
     <section class="summary">
@@ -1644,16 +1598,19 @@ DASHBOARD_HTML = """
 
         <div class="summary-item">
             <span class="summary-label">
-                Hybrid durum
+                ATR risk sistemi
             </span>
 
             <span class="summary-value">
-                {{ "AÇIK" if hybrid_enabled else "KAPALI" }}
+                {{ "%.2f"|format(risk_per_trade_pct) }}% risk
             </span>
 
             <div class="small">
-                Momentum pozisyon limiti:
-                {{ momentum_limit }}
+                ATR periyodu: {{ atr_period }} |
+                Stop çarpanı: {{ atr_stop_multiplier }} |
+                R/R: {{ risk_reward_ratio }} |
+                Trailing: {{ trailing_trigger_r }}R tetik /
+                {{ trailing_distance_r }}R mesafe
             </div>
         </div>
 
@@ -1667,7 +1624,9 @@ DASHBOARD_HTML = """
             </span>
 
             <div class="small">
-                Alış ve satış tarafında uygulanır.
+                Alış ve satış tarafında uygulanır. |
+                Hybrid: {{ "AÇIK" if hybrid_enabled else "KAPALI" }} |
+                Momentum limiti: {{ momentum_limit }}
             </div>
         </div>
     </section>
@@ -1686,6 +1645,7 @@ DASHBOARD_HTML = """
                     <th>Son fiyat</th>
                     <th>TP</th>
                     <th>SL</th>
+                    <th>Stop mesafesi</th>
                     <th>Trailing</th>
                     <th>Anlık K/Z</th>
                     <th>İşlem sonrası tavan</th>
@@ -1734,6 +1694,12 @@ DASHBOARD_HTML = """
                     <td>
                         ${{ "%.8f"|format(
                             position['stop_loss']
+                        ) }}
+                    </td>
+
+                    <td>
+                        %{{ "%.3f"|format(
+                            position['stop_distance_pct'] * 100
                         ) }}
                     </td>
 
@@ -1903,13 +1869,8 @@ DASHBOARD_HTML = """
 @app.route("/")
 def dashboard():
     with state_lock:
-        normal_stats = strategy_summary(
-            "NORMAL"
-        )
-
-        momentum_stats = strategy_summary(
-            "MOMENTUM"
-        )
+        normal_stats = strategy_summary("NORMAL")
+        momentum_stats = strategy_summary("MOMENTUM")
 
         total_pnl = sum(
             safe_float(trade.get("pnl"))
@@ -1927,9 +1888,13 @@ def dashboard():
             momentum_summary=momentum_stats,
             hybrid_enabled=HYBRID_ENABLED,
             momentum_limit=MAX_MOMENTUM_POSITIONS,
-            commission_percent=(
-                COMMISSION_RATE * 100
-            ),
+            commission_percent=(COMMISSION_RATE * 100),
+            risk_per_trade_pct=(RISK_PER_TRADE_PCT * 100),
+            atr_period=ATR_PERIOD,
+            atr_stop_multiplier=ATR_STOP_MULTIPLIER,
+            risk_reward_ratio=RISK_REWARD_RATIO,
+            trailing_trigger_r=TRAILING_TRIGGER_R_MULTIPLE,
+            trailing_distance_r=TRAILING_DISTANCE_R_MULTIPLE,
             current_time=utc_time_string(),
             positions=dict(open_positions),
             trades=list(trade_log),
@@ -1939,13 +1904,8 @@ def dashboard():
 @app.route("/api/status")
 def api_status():
     with state_lock:
-        normal_stats = strategy_summary(
-            "NORMAL"
-        )
-
-        momentum_stats = strategy_summary(
-            "MOMENTUM"
-        )
+        normal_stats = strategy_summary("NORMAL")
+        momentum_stats = strategy_summary("MOMENTUM")
 
         total_pnl = sum(
             safe_float(trade.get("pnl"))
@@ -1961,15 +1921,27 @@ def api_status():
                 "normal_summary": normal_stats,
                 "momentum_summary": momentum_stats,
                 "hybrid_enabled": HYBRID_ENABLED,
+                "risk_system": {
+                    "risk_per_trade_pct": RISK_PER_TRADE_PCT,
+                    "atr_period": ATR_PERIOD,
+                    "atr_stop_multiplier": ATR_STOP_MULTIPLIER,
+                    "risk_reward_ratio": RISK_REWARD_RATIO,
+                    "trailing_trigger_r_multiple": (
+                        TRAILING_TRIGGER_R_MULTIPLE
+                    ),
+                    "trailing_distance_r_multiple": (
+                        TRAILING_DISTANCE_R_MULTIPLE
+                    ),
+                    "min_stop_distance_pct": MIN_STOP_DISTANCE_PCT,
+                    "max_stop_distance_pct": MAX_STOP_DISTANCE_PCT,
+                },
                 "server_time": utc_time_string(),
             }
         )
 
 
 def run_dashboard():
-    port = int(
-        os.environ.get("PORT", "8080")
-    )
+    port = int(os.environ.get("PORT", "8080"))
 
     app.run(
         host="0.0.0.0",
@@ -1977,6 +1949,7 @@ def run_dashboard():
         debug=False,
         use_reloader=False,
     )
+
 
 
 # ============================================================
@@ -1987,54 +1960,43 @@ def run_bot():
     print("=" * 60)
     print("PAPER TRADING BOT BAŞLATILDI")
     print("=" * 60)
+    print(f"Veri kaynağı        : {MARKET_DATA_BASE_URL}")
+    print(f"Ana zaman dilimi    : {TIMEFRAME}")
+    print(f"Momentum zaman dil. : 1m")
+    print(f"Tarama aralığı      : {SCAN_INTERVAL_SECONDS} saniye")
+    print(f"Maksimum pozisyon   : {MAX_OPEN_POSITIONS}")
+    print(f"Maks. allocation    : %{TRADE_SIZE_PERCENT * 100:.2f}")
+    print("-" * 60)
+    print("ATR BAZLI DİNAMİK RİSK SİSTEMİ")
+    print(f"  İşlem başına risk  : %{RISK_PER_TRADE_PCT * 100:.2f}")
+    print(f"  ATR periyodu       : {ATR_PERIOD}")
+    print(f"  ATR stop çarpanı   : {ATR_STOP_MULTIPLIER}")
+    print(f"  Risk/Ödül oranı    : {RISK_REWARD_RATIO}")
     print(
-        f"Veri kaynağı       : "
-        f"{MARKET_DATA_BASE_URL}"
+        f"  Trailing tetik     : "
+        f"{TRAILING_TRIGGER_R_MULTIPLE}R"
     )
     print(
-        f"Ana zaman dilimi   : {TIMEFRAME}"
+        f"  Trailing mesafe    : "
+        f"{TRAILING_DISTANCE_R_MULTIPLE}R"
     )
     print(
-        f"Tarama aralığı     : "
-        f"{SCAN_INTERVAL_SECONDS} saniye"
+        f"  Min stop mesafesi  : "
+        f"%{MIN_STOP_DISTANCE_PCT * 100:.3f}"
     )
     print(
-        f"Maksimum pozisyon  : "
-        f"{MAX_OPEN_POSITIONS}"
+        f"  Maks stop mesafesi : "
+        f"%{MAX_STOP_DISTANCE_PCT * 100:.3f}"
     )
+    print("-" * 60)
     print(
-        f"TP                 : "
-        f"%{TAKE_PROFIT_PCT * 100:.2f}"
-    )
-    print(
-        f"Pozisyon SL        : "
-        f"%{STOP_LOSS_PCT * 100:.2f}"
-    )
-    print(
-        f"Trailing tetikleme : "
-        f"%{TRAILING_TRIGGER_PCT * 100:.2f}"
-    )
-    print(
-        f"Trailing mesafe    : "
-        f"%{TRAILING_DISTANCE_PCT * 100:.2f}"
-    )
-    print(
-        f"Hybrid momentum    : "
+        f"Hybrid momentum     : "
         f"{'AÇIK' if HYBRID_ENABLED else 'KAPALI'}"
     )
-    print(
-        f"Momentum poz. limiti: "
-        f"{MAX_MOMENTUM_POSITIONS}"
-    )
-    print(
-        f"Komisyon varsayımı : "
-        f"%{COMMISSION_RATE * 100:.3f}"
-    )
-    print(
-        f"Başlangıç bakiye   : "
-        f"{INITIAL_BALANCE:.2f} USDT"
-    )
-    print("Günlük zarar kesme : YOK")
+    print(f"Momentum poz. limiti: {MAX_MOMENTUM_POSITIONS}")
+    print(f"Komisyon varsayımı  : %{COMMISSION_RATE * 100:.3f}")
+    print(f"Başlangıç bakiye    : {INITIAL_BALANCE:.2f} USDT")
+    print("Günlük zarar kesme  : YOK")
     print("=" * 60)
 
     while True:
@@ -2054,9 +2016,7 @@ def run_bot():
                         if symbol in open_positions:
                             continue
 
-                    can_trade, reason = (
-                        can_open_new_trade(symbol)
-                    )
+                    can_trade, reason = can_open_new_trade(symbol)
 
                     if not can_trade:
                         continue
@@ -2069,29 +2029,22 @@ def run_bot():
                     if dataframe_3m is None:
                         continue
 
-                    signal = analyze_signal(
-                        dataframe_3m
-                    )
+                    signal = analyze_signal(dataframe_3m)
 
                     strategy = "NORMAL"
                     signal_dataframe = dataframe_3m
 
                     # Önce mevcut 3 dakikalık strateji denenir.
                     # Sinyal yoksa hybrid momentum denenir.
-                    if (
-                        signal is None
-                        and HYBRID_ENABLED
-                    ):
+                    if signal is None and HYBRID_ENABLED:
                         dataframe_1m = get_klines_data(
                             symbol,
                             resample_minutes=1
                         )
 
-                        momentum_signal = (
-                            analyze_momentum_signal(
-                                dataframe_1m,
-                                dataframe_3m
-                            )
+                        momentum_signal = analyze_momentum_signal(
+                            dataframe_1m,
+                            dataframe_3m
                         )
 
                         if momentum_signal is not None:
@@ -2102,6 +2055,7 @@ def run_bot():
                     if signal is None:
                         continue
 
+                    # Sadece tamamlanmış mumla giriş yapılır.
                     signal_candle = signal_dataframe.iloc[-2]
 
                     signal_price = safe_float(
@@ -2111,11 +2065,23 @@ def run_bot():
                     if signal_price <= 0:
                         continue
 
+                    # Her işlemden önce ATR hesaplanır.
+                    # ATR, girişin yapılacağı zaman dilimindeki
+                    # tamamlanmış mumlar üzerinden alınır.
+                    atr_value = get_completed_atr(
+                        signal_dataframe,
+                        ATR_PERIOD
+                    )
+
+                    if atr_value is None or atr_value <= 0:
+                        continue
+
                     opened = execute_trade(
                         symbol,
                         signal,
                         signal_price,
                         signal_candle["datetime"],
+                        atr_value,
                         strategy=strategy
                     )
 
@@ -2136,9 +2102,7 @@ def run_bot():
             break
 
         except Exception as error:
-            print(
-                f"[!] Ana döngü hatası: {error}"
-            )
+            print(f"[!] Ana döngü hatası: {error}")
             time.sleep(5)
 
 
@@ -2151,7 +2115,3 @@ if __name__ == "__main__":
         target=run_dashboard,
         daemon=True
     )
-
-    dashboard_thread.start()
-
-    run_bot()
