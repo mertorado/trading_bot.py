@@ -84,13 +84,20 @@ ATR_STOP_MULTIPLIER = 2.5
 # fazlasıyla karşılıyor.
 RISK_REWARD_RATIO = 2.0
 
-# Trailing stop, kâr bu R katına ulaşınca aktifleşir.
-# 1.3 -> 1.0: çalkantılı ortamda kârı daha erken korumaya al.
-TRAILING_TRIGGER_R_MULTIPLE = 1.0
+# Kâr bu R katına ulaşınca stop girişe (+ komisyon payı) çekilir.
+# Veri kanıtı: işlemler sık sık +0.5R–1R kâr görüp geri dönüp TAM
+# stop yiyordu. Breakeven stop bu işlemleri tam kayıp yerine
+# sıfıra yakın kapatır (ödül/risk asimetrisini düzeltir).
+BREAKEVEN_TRIGGER_R_MULTIPLE = 0.5
 
-# Trailing stop mesafesi (R cinsinden). 0.9 -> 0.7: aktif olunca
+# Trailing stop, kâr bu R katına ulaşınca aktifleşir.
+# 1.0 -> 0.7: sub-1R tepeleri de yakala (çoğu işlem 1R'ye
+# ulaşamadan dönüyordu, trailing hiç devreye girmiyordu).
+TRAILING_TRIGGER_R_MULTIPLE = 0.7
+
+# Trailing stop mesafesi (R cinsinden). 0.7 -> 0.5: aktif olunca
 # kilitlenen kârı artırır.
-TRAILING_DISTANCE_R_MULTIPLE = 0.7
+TRAILING_DISTANCE_R_MULTIPLE = 0.5
 
 # Stop mesafesi yüzde olarak bu sınırlar arasında tutulur.
 # Alt sınır %0.8 -> %1.0: giriş gürültüsüne dayanacak minimum alan.
@@ -1032,6 +1039,24 @@ def has_sufficient_liquidity(symbol):
     return True, f"Volume ${volume_24h_usd:,.0f} yeterli"
 
 
+def get_total_equity():
+    """
+    Toplam öz sermaye = serbest nakit (balance) + açık
+    pozisyonlara yatırılmış tutarların (amount) toplamı.
+
+    Pozisyon büyüklüğü ve allocation limiti bu taban üzerinden
+    hesaplanır. Aksi halde her yeni pozisyon açıldıkça serbest
+    nakit erir ve %10 allocation limiti MIN_POSITION_SIZE'ın
+    altına düşerek bot yeni işlem açamaz hale gelir (starvation).
+    """
+    with state_lock:
+        deployed = sum(
+            position.get("amount", 0.0)
+            for position in open_positions.values()
+        )
+    return balance + deployed
+
+
 def calculate_position_size_with_limits(
     account_balance,
     entry_price,
@@ -1188,11 +1213,17 @@ def execute_trade(
             print(f"[❌ HACİM] {symbol} reddedildi: {liquidity_msg}")
             return False
 
+        # Pozisyon büyüklüğü, serbest nakit değil TOPLAM öz sermaye
+        # (nakit + açık pozisyonlar) üzerinden hesaplanır; böylece
+        # allocation limiti MIN_POSITION_SIZE altına düşüp botu
+        # aç bırakmaz (starvation fix).
+        sizing_base = get_total_equity()
+
         risk = compute_risk_parameters(
             side,
             price,
             atr_value,
-            balance
+            sizing_base
         )
 
         if risk is None:
@@ -1205,7 +1236,7 @@ def execute_trade(
 
         # ---- KONTROL 2: Pozisyon büyüklüğü + limitler ----
         position_size_usdt, size_msg = calculate_position_size_with_limits(
-            balance,
+            sizing_base,
             price,
             stop_distance
         )
@@ -1502,14 +1533,17 @@ def manage_positions():
     Çıkış öncelik sırası (aynı mumda birden fazla seviye
     görülürse STOP önceliklidir):
       1. Trailing stop (aktifse)
-      2. Stop loss
+      2. Stop loss (breakeven'a çekilmiş olabilir)
       3. Take profit
 
-    Trailing stop, R-multiple (yüzde değil) ile çalışır:
+    R-multiple (yüzde değil) ile çalışır:
       - R = giriş anındaki stop mesafesi (fiyat cinsinden)
-      - Kâr TRAILING_TRIGGER_R_MULTIPLE (1R) katına ulaşınca
+      - Kâr BREAKEVEN_TRIGGER_R_MULTIPLE (0.5R) katına ulaşınca
+        stop, giriş + komisyon yastığına çekilir. Böylece yeşile
+        dönmüş bir işlem geri dönüp tam zarar yazmaz.
+      - Kâr TRAILING_TRIGGER_R_MULTIPLE (0.7R) katına ulaşınca
         trailing aktifleşir.
-      - Trailing mesafesi TRAILING_DISTANCE_R_MULTIPLE (0.75R)'dir.
+      - Trailing mesafesi TRAILING_DISTANCE_R_MULTIPLE (0.5R)'dir.
     """
 
     with state_lock:
@@ -1589,7 +1623,22 @@ def manage_positions():
                     position["peak_price"] - entry_price
                 )
 
-                # 1R kâr görüldüğünde trailing aktifleşir
+                # 0.5R kâr görüldüğünde stop, giriş + komisyon
+                # yastığına çekilir (breakeven). Böylece yeşile
+                # dönen işlem tam stop'a geri düşüp zarar yazmaz.
+                breakeven_trigger = (
+                    stop_distance * BREAKEVEN_TRIGGER_R_MULTIPLE
+                )
+                if profit_from_entry >= breakeven_trigger:
+                    breakeven_stop = entry_price + (
+                        entry_price * TOTAL_COMMISSION_RATE
+                    )
+                    position["stop_loss"] = max(
+                        position["stop_loss"],
+                        breakeven_stop
+                    )
+
+                # 0.7R kâr görüldüğünde trailing aktifleşir
                 if profit_from_entry >= trailing_trigger:
                     position["trailing_active"] = True
 
@@ -1622,7 +1671,22 @@ def manage_positions():
                     entry_price - position["peak_price"]
                 )
 
-                # 1R kâr görüldüğünde trailing aktifleşir
+                # 0.5R kâr görüldüğünde stop, giriş - komisyon
+                # yastığına çekilir (breakeven). Böylece yeşile
+                # dönen işlem tam stop'a geri düşüp zarar yazmaz.
+                breakeven_trigger = (
+                    stop_distance * BREAKEVEN_TRIGGER_R_MULTIPLE
+                )
+                if profit_from_entry >= breakeven_trigger:
+                    breakeven_stop = entry_price - (
+                        entry_price * TOTAL_COMMISSION_RATE
+                    )
+                    position["stop_loss"] = min(
+                        position["stop_loss"],
+                        breakeven_stop
+                    )
+
+                # 0.7R kâr görüldüğünde trailing aktifleşir
                 if profit_from_entry >= trailing_trigger:
                     position["trailing_active"] = True
 
