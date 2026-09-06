@@ -2115,3 +2115,7 @@ if __name__ == "__main__":
         target=run_dashboard,
         daemon=True
     )
+
+    dashboard_thread.start()
+
+    run_bot()
