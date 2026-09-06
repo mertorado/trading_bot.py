@@ -695,6 +695,7 @@ def analyze_signal(dataframe):
 
     required_values = [
         previous_candle["close"],
+        current_candle["open"],
         current_candle["close"],
         current_candle["ema_50"],
         trend_ref_candle["ema_50"],
@@ -710,6 +711,7 @@ def analyze_signal(dataframe):
     if any(pd.isna(value) for value in required_values):
         return None
 
+    open_price = safe_float(current_candle["open"])
     close_price = safe_float(current_candle["close"])
     ema_50 = safe_float(current_candle["ema_50"])
     ema_50_ref = safe_float(trend_ref_candle["ema_50"])
@@ -741,6 +743,13 @@ def analyze_signal(dataframe):
     distance_from_ema = abs(close_price - ema_50) / ema_50
     not_overextended = distance_from_ema <= 0.02  # %2
 
+    # Sinyal mumu kendi yönünde kapanmalı. Kapanan kayıp
+    # işlemlerde "maks. olumlu %0" (hiç yeşile dönmeden direkt
+    # stop) sorununun kaynağı: düşen bir mumda LONG / yükselen
+    # bir mumda SHORT açılması. Bu filtre onu engeller.
+    candle_is_bullish = close_price > open_price
+    candle_is_bearish = close_price < open_price
+
     macd_bullish = (
         current_candle["macd"] > current_candle["macd_signal"]
         and (
@@ -757,7 +766,8 @@ def analyze_signal(dataframe):
         )
     )
 
-    # LONG: yükselen trendde, aşırı alımda değilken, kovalamadan
+    # LONG: yükselen trendde, aşırı alımda değilken, kovalamadan,
+    # yeşil kapanan mumda
     long_signal = (
         close_price > ema_50
         and ema_rising
@@ -765,6 +775,7 @@ def analyze_signal(dataframe):
         and 45 <= rsi_value <= 68
         and not_overextended
         and volume_is_healthy
+        and candle_is_bullish
     )
 
     if long_signal:
@@ -778,6 +789,7 @@ def analyze_signal(dataframe):
         and 32 <= rsi_value <= 55
         and not_overextended
         and volume_is_healthy
+        and candle_is_bearish
     )
 
     if short_signal:
