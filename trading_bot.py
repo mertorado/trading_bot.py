@@ -22,21 +22,32 @@ SCAN_INTERVAL_SECONDS = 20
 
 INITIAL_BALANCE = 1000.0
 
-# İşlem başına maksimum allocation (%10)
-TRADE_SIZE_PERCENT = 0.10
+# İşlem başına maksimum allocation (%15)
+# Not: TRADE_SIZE_PERCENT geriye dönük uyumluluk için
+# MAX_ALLOCATION_PCT ile aynı değeri taşır.
+MAX_ALLOCATION_PCT = 0.15
+TRADE_SIZE_PERCENT = MAX_ALLOCATION_PCT
 
 MAX_OPEN_POSITIONS = 10
 
 # Alış ve satışta simüle edilen komisyon oranı
-# 0.001 = %0.10
+# 0.001 = %0.10 (tek taraf). Alış + satış = %0.20 toplam.
 COMMISSION_RATE = 0.001
+
+# Toplam round-trip komisyon oranı (alış + satış)
+TOTAL_COMMISSION_RATE = COMMISSION_RATE * 2  # %0.20
 
 MAX_TRADES_PER_HOUR = 15
 MAX_TRADES_PER_DAY = 50
 
 SYMBOL_COOLDOWN_SECONDS = 900
 
-MIN_24H_VOLUME_USDT = 5_000_000
+# Tarama sırasında minimum 24s USD hacmi (daha agresif eşik)
+MIN_24H_VOLUME_USDT = 500_000
+
+# İşlem öncesi likidite kontrolü için minimum 24s hacim
+MIN_24H_VOLUME = 500_000
+
 VOLUME_SPIKE_FACTOR = 1.8
 
 MIN_PRICE = 0.05
@@ -46,30 +57,39 @@ MAX_SYMBOLS_TO_SCAN = 40
 
 
 # ============================================================
-# ATR BAZLI DİNAMİK RİSK SİSTEMİ
+# ATR BAZLI DİNAMİK RİSK SİSTEMİ (KOMİSYON DOSTU)
 # ============================================================
 
-# Her işlemde hesabın yalnızca %0.5'i riske girer
-RISK_PER_TRADE_PCT = 0.005
+# Her işlemde hesabın %1.5'i riske girer
+RISK_PER_TRADE_PCT = 0.015
 
 # ATR hesaplama periyodu (tamamlanmış mumlar üzerinde)
 ATR_PERIOD = 14
 
 # Stop mesafesi = ATR × ATR_STOP_MULTIPLIER
-ATR_STOP_MULTIPLIER = 1.5
+ATR_STOP_MULTIPLIER = 2.0
 
 # Take-profit mesafesi = stop mesafesi × RISK_REWARD_RATIO
-RISK_REWARD_RATIO = 1.8
+# (komisyonları rahat karşılamak için yükseltildi)
+RISK_REWARD_RATIO = 2.5
 
 # Trailing stop, kâr bu R katına ulaşınca aktifleşir
-TRAILING_TRIGGER_R_MULTIPLE = 1.0
+TRAILING_TRIGGER_R_MULTIPLE = 1.3
 
 # Trailing stop mesafesi (R cinsinden)
-TRAILING_DISTANCE_R_MULTIPLE = 0.75
+TRAILING_DISTANCE_R_MULTIPLE = 0.9
 
 # Stop mesafesi yüzde olarak bu sınırlar arasında tutulur
-MIN_STOP_DISTANCE_PCT = 0.006
-MAX_STOP_DISTANCE_PCT = 0.030
+MIN_STOP_DISTANCE_PCT = 0.008
+MAX_STOP_DISTANCE_PCT = 0.040
+
+# Minimum pozisyon büyüklüğü (USDT). Bunun altındaki
+# pozisyonlar komisyon açısından verimsiz olduğu için açılmaz.
+MIN_POSITION_SIZE = 50
+
+# Komisyonu karşılamak için gereken minimum brüt kâr yüzdesi
+# (round-trip komisyon %0.2 + güvenlik marjı)
+MIN_GROSS_PROFIT_PCT = 0.005
 
 
 # ============================================================
@@ -103,6 +123,20 @@ open_positions = {}
 trade_log = []
 trade_history_timestamps = []
 symbol_cooldowns = {}
+
+# Genel çalışma istatistikleri (dashboard'da gösterilir)
+stats = {
+    "total_commission": 0.0,       # Ödenen toplam komisyon (USDT)
+    "gross_pnl": 0.0,              # Komisyon öncesi toplam brüt K/Z
+    "net_pnl": 0.0,               # Komisyon sonrası toplam net K/Z
+    "volume_rejected": 0,          # Düşük hacim nedeniyle reddedilen
+    "commission_rejected": 0,      # Komisyon kârlılığı nedeniyle reddedilen
+    "min_position_rejected": 0,    # Minimum pozisyon altı reddedilen
+    "position_size_sum": 0.0,      # Açılan pozisyon büyüklükleri toplamı
+    "position_size_count": 0,      # Açılan pozisyon sayısı
+    "position_size_min": None,     # En küçük açılan pozisyon (USDT)
+    "position_size_max": None,     # En büyük açılan pozisyon (USDT)
+}
 
 state_lock = threading.RLock()
 
@@ -249,6 +283,37 @@ def strategy_summary(strategy):
 # COINBASE PİYASA VERİSİ
 # ============================================================
 
+def get_ticker_data(symbol):
+    """
+    Belirli bir sembol için Coinbase ticker verisini döndürür.
+
+    Dönen sözlükte "price" ve "volume" (24s base hacim) alanları
+    bulunur. Hata durumunda None döner.
+    """
+
+    ticker_url = (
+        f"{MARKET_DATA_BASE_URL}"
+        f"/products/{symbol}/ticker"
+    )
+
+    try:
+        ticker_response = requests.get(ticker_url, timeout=10)
+        ticker_response.raise_for_status()
+
+        ticker = ticker_response.json()
+
+        if not isinstance(ticker, dict):
+            return None
+
+        return ticker
+
+    except requests.exceptions.RequestException:
+        return None
+
+    except (ValueError, TypeError):
+        return None
+
+
 def get_top_symbols():
     """
     Coinbase USD paritelerini alır.
@@ -277,41 +342,26 @@ def get_top_symbols():
 
             symbol = product.get("id")
 
-            ticker_url = (
-                f"{MARKET_DATA_BASE_URL}"
-                f"/products/{symbol}/ticker"
-            )
+            ticker = get_ticker_data(symbol)
 
-            try:
-                ticker_response = requests.get(
-                    ticker_url,
-                    timeout=10
-                )
-                ticker_response.raise_for_status()
-
-                ticker = ticker_response.json()
-
-                price = safe_float(ticker.get("price"))
-                base_volume = safe_float(ticker.get("volume"))
-
-                if price <= 0 or base_volume <= 0:
-                    continue
-
-                volume_usd = base_volume * price
-
-                if volume_usd < MIN_24H_VOLUME_USDT:
-                    continue
-
-                if not MIN_PRICE <= price <= MAX_PRICE:
-                    continue
-
-                candidates.append((symbol, volume_usd))
-
-            except requests.exceptions.RequestException:
+            if ticker is None:
                 continue
 
-            except (TypeError, ValueError):
+            price = safe_float(ticker.get("price"))
+            base_volume = safe_float(ticker.get("volume"))
+
+            if price <= 0 or base_volume <= 0:
                 continue
+
+            volume_usd = base_volume * price
+
+            if volume_usd < MIN_24H_VOLUME_USDT:
+                continue
+
+            if not MIN_PRICE <= price <= MAX_PRICE:
+                continue
+
+            candidates.append((symbol, volume_usd))
 
         candidates.sort(
             key=lambda item: item[1],
@@ -629,11 +679,31 @@ def analyze_signal(dataframe):
         >= current_candle["volume_ma"] * VOLUME_SPIKE_FACTOR
     )
 
+    # Sinyaller gevşetildi: RSI bantları genişletildi ve MACD
+    # koşulu (yeni kesişim VEYA süregelen momentum) daha esnek
+    # hale getirildi. Böylece daha fazla nitelikli işlem üretilir;
+    # kârlılık filtrelerini (hacim, komisyon, min pozisyon)
+    # execute_trade katmanı korur.
+    macd_bullish = (
+        current_candle["macd"] > current_candle["macd_signal"]
+        and (
+            previous_candle["macd"] <= previous_candle["macd_signal"]
+            or current_candle["macd"] > previous_candle["macd"]
+        )
+    )
+
+    macd_bearish = (
+        current_candle["macd"] < current_candle["macd_signal"]
+        and (
+            previous_candle["macd"] >= previous_candle["macd_signal"]
+            or current_candle["macd"] < previous_candle["macd"]
+        )
+    )
+
     long_signal = (
         current_candle["close"] > current_candle["ema_50"]
-        and previous_candle["macd"] <= previous_candle["macd_signal"]
-        and current_candle["macd"] > current_candle["macd_signal"]
-        and 40 <= current_candle["rsi"] <= 65
+        and macd_bullish
+        and 35 <= current_candle["rsi"] <= 72
         and volume_is_strong
     )
 
@@ -642,9 +712,8 @@ def analyze_signal(dataframe):
 
     short_signal = (
         current_candle["close"] < current_candle["ema_50"]
-        and previous_candle["macd"] >= previous_candle["macd_signal"]
-        and current_candle["macd"] < current_candle["macd_signal"]
-        and 35 <= current_candle["rsi"] <= 60
+        and macd_bearish
+        and 28 <= current_candle["rsi"] <= 65
         and volume_is_strong
     )
 
@@ -815,6 +884,156 @@ def can_open_new_trade(symbol):
 # ATR BAZLI POZİSYON BÜYÜKLÜĞÜ VE RİSK HESABI
 # ============================================================
 
+def calculate_commission(position_size_usdt):
+    """
+    Round-trip komisyon: Coinbase %0.1 alış + %0.1 satış = %0.2.
+
+    position_size_usdt: pozisyonun USDT cinsinden büyüklüğü.
+    """
+    return position_size_usdt * TOTAL_COMMISSION_RATE
+
+
+def calculate_net_profit(entry_price, exit_price, position_size, side):
+    """
+    Komisyon dahil gerçek net kârı hesaplar.
+
+    position_size: coin adedi (miktar). Notional büyüklük
+    position_size * entry_price ile bulunur ve round-trip
+    komisyon bu notional üzerinden uygulanır.
+
+    Döner: (net_profit, commission)
+    """
+    position_size_usdt = position_size * entry_price
+    commission = calculate_commission(position_size_usdt)
+
+    if side == "LONG":
+        gross_profit = (exit_price - entry_price) * position_size
+    else:
+        gross_profit = (entry_price - exit_price) * position_size
+
+    net_profit = gross_profit - commission
+
+    return net_profit, commission
+
+
+def is_trade_worth_commission(
+    entry_price,
+    take_profit,
+    position_size_usdt
+):
+    """
+    İşlem komisyonları karşılayıp pozitif net kâr bırakıyor mu?
+
+    Minimum brüt kâr yüzdesi MIN_GROSS_PROFIT_PCT (%0.5) olmalı
+    (round-trip komisyon %0.2 + güvenlik marjı). Ayrıca hedefe
+    ulaşıldığında net kârın pozitif olması gerekir.
+
+    Döner: (uygun_mu, mesaj)
+    """
+    if entry_price <= 0 or position_size_usdt <= 0:
+        return False, "Geçersiz giriş fiyatı veya pozisyon büyüklüğü"
+
+    gross_profit_pct = abs(take_profit - entry_price) / entry_price
+
+    if gross_profit_pct < MIN_GROSS_PROFIT_PCT:
+        return (
+            False,
+            f"Brüt kâr %{gross_profit_pct * 100:.2f} < "
+            f"minimum %{MIN_GROSS_PROFIT_PCT * 100:.2f}"
+        )
+
+    # Hedefe ulaşıldığındaki gerçek net kârı kontrol et
+    gross_profit_usdt = gross_profit_pct * position_size_usdt
+    commission = calculate_commission(position_size_usdt)
+    net_profit = gross_profit_usdt - commission
+
+    if net_profit <= 0:
+        return (
+            False,
+            f"Net kâr ${net_profit:.4f} <= 0 (komisyon sonrası)"
+        )
+
+    return True, f"Net kâr ${net_profit:.4f} pozitif"
+
+
+def has_sufficient_liquidity(symbol):
+    """
+    24 saatlik hacim kontrolü (düşük hacim = slippage riski).
+
+    Döner: (yeterli_mi, mesaj)
+    """
+    ticker = get_ticker_data(symbol)
+
+    if ticker is None:
+        return False, "Volume bilgisi alınamadı"
+
+    price = safe_float(ticker.get("price"))
+    base_volume = safe_float(ticker.get("volume"))
+
+    # 24s USD hacmi = base hacim × fiyat
+    volume_24h_usd = base_volume * price
+
+    if volume_24h_usd < MIN_24H_VOLUME:
+        return (
+            False,
+            f"Volume ${volume_24h_usd:,.0f} < "
+            f"minimum ${MIN_24H_VOLUME:,.0f}"
+        )
+
+    return True, f"Volume ${volume_24h_usd:,.0f} yeterli"
+
+
+def calculate_position_size_with_limits(
+    account_balance,
+    entry_price,
+    atr_stop_distance
+):
+    """
+    Pozisyon büyüklüğünü hem ATR riskine hem de allocation
+    limitine göre hesaplar ve minimum pozisyon kontrolü yapar.
+
+    account_balance : güncel bakiye (USDT)
+    entry_price     : giriş fiyatı
+    atr_stop_distance : stop mesafesi (fiyat cinsinden)
+
+    Döner: (position_size_usdt, mesaj)
+    position_size_usdt None ise pozisyon açılmamalıdır.
+    """
+    if (
+        account_balance <= 0
+        or entry_price <= 0
+        or atr_stop_distance <= 0
+    ):
+        return None, "Geçersiz risk girdileri"
+
+    # ATR bazlı pozisyon (risk = bakiye × RISK_PER_TRADE_PCT)
+    risk_amount = account_balance * RISK_PER_TRADE_PCT
+    position_size_coins = risk_amount / atr_stop_distance
+    position_size_usdt_atr = position_size_coins * entry_price
+
+    # Allocation bazlı üst sınır
+    max_position_usdt = account_balance * MAX_ALLOCATION_PCT
+
+    # İkisinden küçük olanı seç
+    final_position_usdt = min(
+        position_size_usdt_atr,
+        max_position_usdt
+    )
+
+    # Minimum pozisyon kontrolü
+    if final_position_usdt < MIN_POSITION_SIZE:
+        return (
+            None,
+            f"Pozisyon ${final_position_usdt:.2f} < "
+            f"minimum ${MIN_POSITION_SIZE}"
+        )
+
+    return (
+        final_position_usdt,
+        f"Pozisyon ${final_position_usdt:.2f} hesaplandı"
+    )
+
+
 def compute_risk_parameters(side, price, atr_value, current_balance):
     """
     ATR bazlı dinamik risk hesaplaması.
@@ -912,6 +1131,14 @@ def execute_trade(
             print(f"[!] {symbol} için geçerli ATR yok, işlem atlandı")
             return False
 
+        # ---- KONTROL 1: 24s hacim / likidite ----
+        liquidity_ok, liquidity_msg = has_sufficient_liquidity(symbol)
+
+        if not liquidity_ok:
+            stats["volume_rejected"] += 1
+            print(f"[❌ HACİM] {symbol} reddedildi: {liquidity_msg}")
+            return False
+
         risk = compute_risk_parameters(
             side,
             price,
@@ -924,10 +1151,50 @@ def execute_trade(
             return False
 
         trade_amount = risk["trade_amount"]
+        stop_distance = risk["stop_distance"]
+        take_profit = risk["take_profit"]
 
-        if trade_amount < 10:
-            print("[!] İşlem tutarı 10 USDT altında")
+        # ---- KONTROL 2: Pozisyon büyüklüğü + limitler ----
+        position_size_usdt, size_msg = calculate_position_size_with_limits(
+            balance,
+            price,
+            stop_distance
+        )
+
+        if position_size_usdt is None:
+            stats["min_position_rejected"] += 1
+            print(f"[❌ POZİSYON] {symbol} reddedildi: {size_msg}")
             return False
+
+        # compute_risk_parameters ile aynı allocation limitini
+        # uygular; ikisinden küçük olanı kullanarak tutarlılık sağla.
+        trade_amount = min(trade_amount, position_size_usdt)
+
+        if trade_amount < MIN_POSITION_SIZE:
+            stats["min_position_rejected"] += 1
+            print(
+                f"[❌ POZİSYON] {symbol} reddedildi: "
+                f"işlem tutarı ${trade_amount:.2f} < "
+                f"minimum ${MIN_POSITION_SIZE}"
+            )
+            return False
+
+        # ---- KONTROL 3: Komisyon sonrası kâr uygunluğu ----
+        worth_ok, worth_msg = is_trade_worth_commission(
+            price,
+            take_profit,
+            trade_amount
+        )
+
+        if not worth_ok:
+            stats["commission_rejected"] += 1
+            print(f"[❌ KOMİSYON] {symbol} reddedildi: {worth_msg}")
+            return False
+
+        print(
+            f"[✅ ONAY] {symbol} {side} tüm filtrelerden geçti "
+            f"({liquidity_msg}; {worth_msg})"
+        )
 
         entry_fee = trade_amount * COMMISSION_RATE
 
@@ -936,9 +1203,23 @@ def execute_trade(
             return False
 
         stop_loss = risk["stop_loss"]
-        take_profit = risk["take_profit"]
-        stop_distance = risk["stop_distance"]
         stop_distance_pct = risk["stop_distance_pct"]
+
+        # Pozisyon büyüklüğü istatistikleri
+        stats["position_size_sum"] += trade_amount
+        stats["position_size_count"] += 1
+        if stats["position_size_min"] is None:
+            stats["position_size_min"] = trade_amount
+        else:
+            stats["position_size_min"] = min(
+                stats["position_size_min"], trade_amount
+            )
+        if stats["position_size_max"] is None:
+            stats["position_size_max"] = trade_amount
+        else:
+            stats["position_size_max"] = max(
+                stats["position_size_max"], trade_amount
+            )
 
         balance -= trade_amount + entry_fee
 
@@ -1040,6 +1321,13 @@ def close_position(symbol, position, exit_price, exit_reason):
     net_return = gross_return - exit_fee
 
     total_pnl = net_return - amount - entry_fee
+
+    # Komisyon ve K/Z istatistikleri
+    trade_commission = entry_fee + exit_fee
+    gross_pnl = gross_return - amount  # komisyon öncesi brüt K/Z
+    stats["total_commission"] += trade_commission
+    stats["gross_pnl"] += gross_pnl
+    stats["net_pnl"] += total_pnl
 
     balance += net_return
 
@@ -1625,8 +1913,107 @@ DASHBOARD_HTML = """
 
             <div class="small">
                 Alış ve satış tarafında uygulanır. |
+                Round-trip: {{ "%.2f"|format(total_commission_percent) }}% |
                 Hybrid: {{ "AÇIK" if hybrid_enabled else "KAPALI" }} |
                 Momentum limiti: {{ momentum_limit }}
+            </div>
+        </div>
+    </section>
+
+    <h2>💰 Gerçek Para / Komisyon İstatistikleri</h2>
+
+    <section class="summary">
+        <div class="summary-item">
+            <span class="summary-label">
+                Ödenen toplam komisyon
+            </span>
+
+            <span class="summary-value negative">
+                {{ "%.4f"|format(stats['total_commission']) }} USDT
+            </span>
+        </div>
+
+        <div class="summary-item">
+            <span class="summary-label">
+                Brüt K/Z (komisyon öncesi)
+            </span>
+
+            <span class="summary-value
+                {{ 'positive' if stats['gross_pnl'] >= 0
+                   else 'negative' }}">
+                {{ "%+.4f"|format(stats['gross_pnl']) }} USDT
+            </span>
+        </div>
+
+        <div class="summary-item">
+            <span class="summary-label">
+                Net K/Z (komisyon sonrası)
+            </span>
+
+            <span class="summary-value
+                {{ 'positive' if stats['net_pnl'] >= 0
+                   else 'negative' }}">
+                {{ "%+.4f"|format(stats['net_pnl']) }} USDT
+            </span>
+        </div>
+
+        <div class="summary-item">
+            <span class="summary-label">
+                Pozisyon büyüklüğü (min/ort/maks)
+            </span>
+
+            <span class="summary-value">
+                {{ "%.0f"|format(stats['position_size_min']) }} /
+                {{ "%.0f"|format(stats['position_size_avg']) }} /
+                {{ "%.0f"|format(stats['position_size_max']) }}
+            </span>
+
+            <div class="small">
+                USDT | Açılan pozisyon: {{ stats['position_count'] }} |
+                Min: ${{ min_position_size }} |
+                Maks allocation: {{ "%.1f"|format(max_allocation_pct) }}%
+            </div>
+        </div>
+
+        <div class="summary-item">
+            <span class="summary-label">
+                Düşük hacim reddi
+            </span>
+
+            <span class="summary-value">
+                {{ stats['volume_rejected'] }}
+            </span>
+
+            <div class="small">
+                Min 24s hacim: ${{ "{:,.0f}".format(min_24h_volume) }}
+            </div>
+        </div>
+
+        <div class="summary-item">
+            <span class="summary-label">
+                Komisyon reddi
+            </span>
+
+            <span class="summary-value">
+                {{ stats['commission_rejected'] }}
+            </span>
+
+            <div class="small">
+                Komisyon sonrası kârsız işlemler engellendi
+            </div>
+        </div>
+
+        <div class="summary-item">
+            <span class="summary-label">
+                Min pozisyon reddi
+            </span>
+
+            <span class="summary-value">
+                {{ stats['min_position_rejected'] }}
+            </span>
+
+            <div class="small">
+                ${{ min_position_size }} altı işlemler engellendi
             </div>
         </div>
     </section>
@@ -1866,6 +2253,39 @@ DASHBOARD_HTML = """
 """
 
 
+def build_stats_snapshot():
+    """
+    Komisyon, brüt/net K/Z, pozisyon büyüklüğü ve filtre
+    reddi istatistiklerinin türetilmiş özetini üretir.
+    state_lock altında çağrılmalıdır.
+    """
+    count = stats["position_size_count"]
+
+    if count > 0:
+        avg_position = stats["position_size_sum"] / count
+    else:
+        avg_position = 0.0
+
+    return {
+        "total_commission": round(stats["total_commission"], 4),
+        "gross_pnl": round(stats["gross_pnl"], 4),
+        "net_pnl": round(stats["net_pnl"], 4),
+        "volume_rejected": stats["volume_rejected"],
+        "commission_rejected": stats["commission_rejected"],
+        "min_position_rejected": stats["min_position_rejected"],
+        "position_count": count,
+        "position_size_avg": round(avg_position, 2),
+        "position_size_min": (
+            round(stats["position_size_min"], 2)
+            if stats["position_size_min"] is not None else 0.0
+        ),
+        "position_size_max": (
+            round(stats["position_size_max"], 2)
+            if stats["position_size_max"] is not None else 0.0
+        ),
+    }
+
+
 @app.route("/")
 def dashboard():
     with state_lock:
@@ -1876,6 +2296,8 @@ def dashboard():
             safe_float(trade.get("pnl"))
             for trade in trade_log
         )
+
+        stats_snapshot = build_stats_snapshot()
 
         return render_template_string(
             DASHBOARD_HTML,
@@ -1889,12 +2311,17 @@ def dashboard():
             hybrid_enabled=HYBRID_ENABLED,
             momentum_limit=MAX_MOMENTUM_POSITIONS,
             commission_percent=(COMMISSION_RATE * 100),
+            total_commission_percent=(TOTAL_COMMISSION_RATE * 100),
             risk_per_trade_pct=(RISK_PER_TRADE_PCT * 100),
             atr_period=ATR_PERIOD,
             atr_stop_multiplier=ATR_STOP_MULTIPLIER,
             risk_reward_ratio=RISK_REWARD_RATIO,
             trailing_trigger_r=TRAILING_TRIGGER_R_MULTIPLE,
             trailing_distance_r=TRAILING_DISTANCE_R_MULTIPLE,
+            min_position_size=MIN_POSITION_SIZE,
+            max_allocation_pct=(MAX_ALLOCATION_PCT * 100),
+            min_24h_volume=MIN_24H_VOLUME,
+            stats=stats_snapshot,
             current_time=utc_time_string(),
             positions=dict(open_positions),
             trades=list(trade_log),
@@ -1912,6 +2339,8 @@ def api_status():
             for trade in trade_log
         )
 
+        stats_snapshot = build_stats_snapshot()
+
         return jsonify(
             {
                 "balance": round(balance, 4),
@@ -1921,6 +2350,7 @@ def api_status():
                 "normal_summary": normal_stats,
                 "momentum_summary": momentum_stats,
                 "hybrid_enabled": HYBRID_ENABLED,
+                "commission_stats": stats_snapshot,
                 "risk_system": {
                     "risk_per_trade_pct": RISK_PER_TRADE_PCT,
                     "atr_period": ATR_PERIOD,
@@ -1934,6 +2364,10 @@ def api_status():
                     ),
                     "min_stop_distance_pct": MIN_STOP_DISTANCE_PCT,
                     "max_stop_distance_pct": MAX_STOP_DISTANCE_PCT,
+                    "min_position_size": MIN_POSITION_SIZE,
+                    "max_allocation_pct": MAX_ALLOCATION_PCT,
+                    "min_24h_volume": MIN_24H_VOLUME,
+                    "total_commission_rate": TOTAL_COMMISSION_RATE,
                 },
                 "server_time": utc_time_string(),
             }
@@ -1997,6 +2431,26 @@ def run_bot():
     print(f"Komisyon varsayımı  : %{COMMISSION_RATE * 100:.3f}")
     print(f"Başlangıç bakiye    : {INITIAL_BALANCE:.2f} USDT")
     print("Günlük zarar kesme  : YOK")
+    print("=" * 60)
+    print(
+        f"🎯 RİSK: İşlem başına %{RISK_PER_TRADE_PCT * 100:.2f} risk | "
+        f"ATR x{ATR_STOP_MULTIPLIER} stop | "
+        f"R/Ö {RISK_REWARD_RATIO}"
+    )
+    print(
+        f"💰 KOMİSYON: Round-trip %{TOTAL_COMMISSION_RATE * 100:.2f} | "
+        f"Min brüt kâr hedefi %{MIN_GROSS_PROFIT_PCT * 100:.2f}"
+    )
+    print(
+        f"📊 POZİSYON: Min ${MIN_POSITION_SIZE} | "
+        f"Maks allocation %{MAX_ALLOCATION_PCT * 100:.2f} bakiye"
+    )
+    print(
+        f"📈 VOLUME: Minimum 24s hacim ${MIN_24H_VOLUME:,.0f} "
+        f"(slippage koruması)"
+    )
+    print("⚠️  GERÇEK PARA MODU HAZIR: Her işlem komisyon sonrası "
+          "pozitif net kâr için filtreleniyor")
     print("=" * 60)
 
     while True:
