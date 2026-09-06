@@ -119,12 +119,15 @@ MIN_GROSS_PROFIT_PCT = 0.005
 
 HYBRID_ENABLED = True
 
-# Aynı anda en fazla iki momentum pozisyonu
-MAX_MOMENTUM_POSITIONS = 2
+# Aynı anda en fazla bir momentum pozisyonu. Momentum stratejisi
+# canlı veride sürekli net zarar yazdığı için (0/4, kümülatif 4/8)
+# maruziyet 2 -> 1'e indirildi; kalitesini kanıtlayana kadar kısık.
+MAX_MOMENTUM_POSITIONS = 1
 
 # 1 dakikalık mum hacmi, son 20 mum ortalamasının
-# en az bu katı olmalı
-MOMENTUM_VOLUME_SPIKE_FACTOR = 2.0
+# en az bu katı olmalı. 2.0 -> 2.5: yalancı kırılımları eler,
+# sadece güçlü hacimli hareketlerde giriş yapılır.
+MOMENTUM_VOLUME_SPIKE_FACTOR = 2.5
 
 # Kırılma için geriye bakılacak 1 dakikalık mum sayısı
 MOMENTUM_BREAKOUT_LOOKBACK = 5
@@ -133,6 +136,15 @@ MOMENTUM_BREAKOUT_LOOKBACK = 5
 # bot hareketi kovalamaz. 0.015 -> 0.008: uzamış kırılımların
 # tepesinden girmeyi engeller (spike kovalamayı azaltır).
 MOMENTUM_MAX_EXTENSION_PCT = 0.008
+
+# Kırılma, eski uç seviyeyi en az bu oranda geçmeli. 1 tık'lık
+# sahte kırılımları (hemen geri dönenleri) eler.
+MOMENTUM_MIN_BREAKOUT_PCT = 0.0015
+
+# Kırılma mumu, kendi menzilinin bu oranından fazlasını yönünde
+# kapatmalı (long'da tepeye yakın, short'ta dibe yakın kapanış).
+# Fitilli/zayıf kırılım mumlarını eler.
+MOMENTUM_MIN_CLOSE_STRENGTH = 0.55
 
 
 # ============================================================
@@ -857,14 +869,36 @@ def analyze_momentum_signal(dataframe_1m, dataframe_3m):
         and trend_candle["macd"] < trend_candle["macd_signal"]
     )
 
+    current_high = safe_float(current_candle["high"])
+    current_low = safe_float(current_candle["low"])
+    candle_range = current_high - current_low
+
+    # Kapanış gücü: mum kendi menzilinin neresinde kapandı?
+    # long -> tepeye yakın (>=0.55), short -> dibe yakın.
+    if candle_range > 0:
+        close_strength_long = (
+            (current_close - current_low) / candle_range
+        )
+        close_strength_short = (
+            (current_high - current_close) / candle_range
+        )
+    else:
+        close_strength_long = 0.0
+        close_strength_short = 0.0
+
+    # Kırılma, eski uç seviyeyi en az MOMENTUM_MIN_BREAKOUT_PCT
+    # kadar geçmeli (sahte 1 tık kırılımları elenir) ve mum
+    # yönünde güçlü kapanmalı (fitilli kırılımlar elenir).
     long_breakout = (
-        current_close > previous_high
+        current_close > previous_high * (1 + MOMENTUM_MIN_BREAKOUT_PCT)
         and current_close > current_open
+        and close_strength_long >= MOMENTUM_MIN_CLOSE_STRENGTH
     )
 
     short_breakout = (
-        current_close < previous_low
+        current_close < previous_low * (1 - MOMENTUM_MIN_BREAKOUT_PCT)
         and current_close < current_open
+        and close_strength_short >= MOMENTUM_MIN_CLOSE_STRENGTH
     )
 
     if long_breakout:
