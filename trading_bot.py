@@ -91,6 +91,19 @@ ADX_MIN_TREND_STRENGTH = 22
 MTF_TREND_ENABLED = True
 MTF_GRANULARITY_SECONDS = 900  # 15 dakika
 
+# --- MACD SIFIR ÇİZGİSİ YÖN TEYİDİ + HİSTOGRAM GÜCÜ (yumuşak) ---
+# Araştırma bulgusu: MACD crossover'ın sıfır çizgisine göre konumu
+# sinyalin TİPİNİ belirler. Sıfırın ALTINDA yukarı crossover = güçlü
+# DÖNÜŞ (long), ÜSTÜNDE aşağı crossover = güçlü dönüş (short). Bu
+# yumuşak filtre bir sinyali komple yasaklamaz; sadece "ters bağlamda
+# ve momentum GÜÇLÜ değilken" açılan zayıf işlemleri eler. Böylece
+# işlem frekansı korunur, kalite artar.
+#   - Sıfırın altında LONG (dönüş) -> daima geçerli.
+#   - Sıfırın üstünde LONG (devam) -> sadece histogram genişliyorsa.
+#   - Sıfırın üstünde SHORT (dönüş) -> daima geçerli.
+#   - Sıfırın altında SHORT (devam) -> sadece histogram genişliyorsa.
+MACD_ZERO_LINE_FILTER_ENABLED = True
+
 # Stop mesafesi = ATR × ATR_STOP_MULTIPLIER. 2.0 -> 2.5:
 # stop'a normal piyasa gürültüsünün değmemesi için genişletildi
 # (önceki dar stoplar giriş sonrası salınımda hemen vuruluyordu).
@@ -764,6 +777,13 @@ def calculate_indicators(dataframe):
         adjust=False
     ).mean()
 
+    # MACD histogramı = MACD - sinyal çizgisi. Momentumun GÜCÜNÜ
+    # ölçer: histogram açılıyorsa (mutlak değeri büyüyorsa) momentum
+    # kuvvetleniyor, daralıyorsa zayıflıyor demektir.
+    dataframe["macd_hist"] = (
+        dataframe["macd"] - dataframe["macd_signal"]
+    )
+
     price_change = close.diff()
 
     gains = price_change.where(price_change > 0, 0)
@@ -863,6 +883,8 @@ def analyze_signal(dataframe):
         previous_candle["macd_signal"],
         current_candle["macd"],
         current_candle["macd_signal"],
+        current_candle["macd_hist"],
+        previous_candle["macd_hist"],
         current_candle["rsi"],
         current_candle["volume"],
         current_candle["volume_ma"],
@@ -933,12 +955,43 @@ def analyze_signal(dataframe):
         )
     )
 
+    # --- MACD SIFIR ÇİZGİSİ YÖN TEYİDİ + HİSTOGRAM GÜCÜ (yumuşak) ---
+    # macd < 0 -> kısa vade uzun vadenin ALTINDA (ayı bağlamı)
+    # macd > 0 -> kısa vade uzun vadenin ÜSTÜNDE (boğa bağlamı)
+    macd_value = safe_float(current_candle["macd"])
+    hist_now = safe_float(current_candle["macd_hist"])
+    hist_prev = safe_float(previous_candle["macd_hist"])
+
+    # Histogram "genişliyor mu?" = momentum kuvvetleniyor mu?
+    # LONG için histogram artıyorsa (daha pozitif), SHORT için
+    # histogram düşüyorsa (daha negatif) momentum o yönde güçleniyor.
+    hist_expanding_up = hist_now > hist_prev
+    hist_expanding_down = hist_now < hist_prev
+
+    # Yumuşak kapı: sinyali komple yasaklamaz, sadece ters bağlamdaki
+    # ZAYIF (momentum genişlemeyen) işlemleri eler.
+    if MACD_ZERO_LINE_FILTER_ENABLED:
+        # LONG: sıfırın altında (dönüş) her zaman OK; sıfırın üstünde
+        # (devam) sadece momentum genişliyorsa OK.
+        long_macd_context_ok = (
+            macd_value < 0 or hist_expanding_up
+        )
+        # SHORT: sıfırın üstünde (dönüş) her zaman OK; sıfırın altında
+        # (devam) sadece momentum genişliyorsa OK.
+        short_macd_context_ok = (
+            macd_value > 0 or hist_expanding_down
+        )
+    else:
+        long_macd_context_ok = True
+        short_macd_context_ok = True
+
     # LONG: yükselen trendde, aşırı alımda değilken, kovalamadan,
     # yeşil kapanan mumda
     long_signal = (
         close_price > ema_50
         and ema_rising
         and macd_bullish
+        and long_macd_context_ok
         and 45 <= rsi_value <= 68
         and not_overextended
         and volume_is_healthy
@@ -953,6 +1006,7 @@ def analyze_signal(dataframe):
         close_price < ema_50
         and ema_falling
         and macd_bearish
+        and short_macd_context_ok
         and 32 <= rsi_value <= 55
         and not_overextended
         and volume_is_healthy
@@ -991,6 +1045,7 @@ def analyze_momentum_signal(dataframe_1m, dataframe_3m):
     momentum_data = calculate_indicators(dataframe_1m)
 
     trend_candle = trend_data.iloc[-2]
+    trend_prev_candle = trend_data.iloc[-3]
     current_candle = momentum_data.iloc[-2]
 
     lookback_start = -(MOMENTUM_BREAKOUT_LOOKBACK + 2)
@@ -1002,6 +1057,8 @@ def analyze_momentum_signal(dataframe_1m, dataframe_3m):
         trend_candle["ema_50"],
         trend_candle["macd"],
         trend_candle["macd_signal"],
+        trend_candle["macd_hist"],
+        trend_prev_candle["macd_hist"],
         trend_candle["adx"],
         current_candle["open"],
         current_candle["close"],
@@ -1045,14 +1102,36 @@ def analyze_momentum_signal(dataframe_1m, dataframe_3m):
         >= volume_average * MOMENTUM_VOLUME_SPIKE_FACTOR
     )
 
+    # MACD sıfır çizgisi yön teyidi + histogram gücü (yumuşak):
+    # 3dk trend mumunun MACD bağlamına bakılır. Ters bağlamdaki
+    # (devam) kırılımlar yalnızca momentum genişliyorsa kabul edilir.
+    trend_macd_value = safe_float(trend_candle["macd"])
+    trend_hist_now = safe_float(trend_candle["macd_hist"])
+    trend_hist_prev = safe_float(trend_prev_candle["macd_hist"])
+    trend_hist_expanding_up = trend_hist_now > trend_hist_prev
+    trend_hist_expanding_down = trend_hist_now < trend_hist_prev
+
+    if MACD_ZERO_LINE_FILTER_ENABLED:
+        long_macd_context_ok = (
+            trend_macd_value < 0 or trend_hist_expanding_up
+        )
+        short_macd_context_ok = (
+            trend_macd_value > 0 or trend_hist_expanding_down
+        )
+    else:
+        long_macd_context_ok = True
+        short_macd_context_ok = True
+
     long_trend = (
         trend_candle["close"] > trend_candle["ema_50"]
         and trend_candle["macd"] > trend_candle["macd_signal"]
+        and long_macd_context_ok
     )
 
     short_trend = (
         trend_candle["close"] < trend_candle["ema_50"]
         and trend_candle["macd"] < trend_candle["macd_signal"]
+        and short_macd_context_ok
     )
 
     current_high = safe_float(current_candle["high"])
@@ -2723,6 +2802,9 @@ def api_status():
                     "adx_min_trend_strength": ADX_MIN_TREND_STRENGTH,
                     "mtf_trend_enabled": MTF_TREND_ENABLED,
                     "mtf_granularity_seconds": MTF_GRANULARITY_SECONDS,
+                    "macd_zero_line_filter_enabled": (
+                        MACD_ZERO_LINE_FILTER_ENABLED
+                    ),
                 },
                 "server_time": utc_time_string(),
             }
@@ -2788,6 +2870,11 @@ def run_bot():
         f"  15dk MTF teyidi    : "
         f"{'AÇIK' if MTF_TREND_ENABLED else 'KAPALI'} "
         f"({MTF_GRANULARITY_SECONDS // 60}dk trendine ters sinyaller reddedilir)"
+    )
+    print(
+        f"  MACD 0-çizgisi     : "
+        f"{'AÇIK' if MACD_ZERO_LINE_FILTER_ENABLED else 'KAPALI'} "
+        f"(yön teyidi + histogram gücü, ters bağlamda zayıf işlem elenir)"
     )
     print("-" * 60)
     print(
