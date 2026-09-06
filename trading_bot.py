@@ -22,10 +22,12 @@ SCAN_INTERVAL_SECONDS = 20
 
 INITIAL_BALANCE = 1000.0
 
-# İşlem başına maksimum allocation (%15)
+# İşlem başına maksimum allocation (%10)
 # Not: TRADE_SIZE_PERCENT geriye dönük uyumluluk için
 # MAX_ALLOCATION_PCT ile aynı değeri taşır.
-MAX_ALLOCATION_PCT = 0.15
+# %10 x 10 pozisyon = en fazla %100 toplam maruziyet (aşırı
+# yüklenmeyi önler; önceki %15 ayarı %150'ye kadar çıkabiliyordu).
+MAX_ALLOCATION_PCT = 0.10
 TRADE_SIZE_PERCENT = MAX_ALLOCATION_PCT
 
 MAX_OPEN_POSITIONS = 10
@@ -48,7 +50,11 @@ MIN_24H_VOLUME_USDT = 500_000
 # İşlem öncesi likidite kontrolü için minimum 24s hacim
 MIN_24H_VOLUME = 500_000
 
-VOLUME_SPIKE_FACTOR = 1.8
+# Hacim, ortalamanın en az bu katı olmalı. Önceki 1.8 değeri
+# "hacim patlaması" (exhaustion) anında giriş yapıp tepeden
+# alınmasına yol açıyordu. 1.15 = sağlıklı/ortalama üstü hacim
+# ister ama patlama tepesini kovalamaz.
+VOLUME_SPIKE_FACTOR = 1.15
 
 MIN_PRICE = 0.05
 MAX_PRICE = 100.0
@@ -60,27 +66,35 @@ MAX_SYMBOLS_TO_SCAN = 40
 # ATR BAZLI DİNAMİK RİSK SİSTEMİ (KOMİSYON DOSTU)
 # ============================================================
 
-# Her işlemde hesabın %1.5'i riske girer
-RISK_PER_TRADE_PCT = 0.015
+# Her işlemde hesabın %1.0'i riske girer. Kanıtlanmamış bir
+# stratejiyi büyük risklerle çalıştırmamak için %1.5'ten düşürüldü.
+RISK_PER_TRADE_PCT = 0.010
 
 # ATR hesaplama periyodu (tamamlanmış mumlar üzerinde)
 ATR_PERIOD = 14
 
-# Stop mesafesi = ATR × ATR_STOP_MULTIPLIER
-ATR_STOP_MULTIPLIER = 2.0
+# Stop mesafesi = ATR × ATR_STOP_MULTIPLIER. 2.0 -> 2.5:
+# stop'a normal piyasa gürültüsünün değmemesi için genişletildi
+# (önceki dar stoplar giriş sonrası salınımda hemen vuruluyordu).
+ATR_STOP_MULTIPLIER = 2.5
 
-# Take-profit mesafesi = stop mesafesi × RISK_REWARD_RATIO
-# (komisyonları rahat karşılamak için yükseltildi)
-RISK_REWARD_RATIO = 2.5
+# Take-profit mesafesi = stop mesafesi × RISK_REWARD_RATIO.
+# 2.5 -> 2.0: daha ulaşılabilir hedef (2.5R bu zaman diliminde
+# nadiren görülüyordu). Geniş stop ile 2.0R hâlâ komisyonu
+# fazlasıyla karşılıyor.
+RISK_REWARD_RATIO = 2.0
 
-# Trailing stop, kâr bu R katına ulaşınca aktifleşir
-TRAILING_TRIGGER_R_MULTIPLE = 1.3
+# Trailing stop, kâr bu R katına ulaşınca aktifleşir.
+# 1.3 -> 1.0: çalkantılı ortamda kârı daha erken korumaya al.
+TRAILING_TRIGGER_R_MULTIPLE = 1.0
 
-# Trailing stop mesafesi (R cinsinden)
-TRAILING_DISTANCE_R_MULTIPLE = 0.9
+# Trailing stop mesafesi (R cinsinden). 0.9 -> 0.7: aktif olunca
+# kilitlenen kârı artırır.
+TRAILING_DISTANCE_R_MULTIPLE = 0.7
 
-# Stop mesafesi yüzde olarak bu sınırlar arasında tutulur
-MIN_STOP_DISTANCE_PCT = 0.008
+# Stop mesafesi yüzde olarak bu sınırlar arasında tutulur.
+# Alt sınır %0.8 -> %1.0: giriş gürültüsüne dayanacak minimum alan.
+MIN_STOP_DISTANCE_PCT = 0.010
 MAX_STOP_DISTANCE_PCT = 0.040
 
 # Minimum pozisyon büyüklüğü (USDT). Bunun altındaki
@@ -109,8 +123,9 @@ MOMENTUM_VOLUME_SPIKE_FACTOR = 2.0
 MOMENTUM_BREAKOUT_LOOKBACK = 5
 
 # Kırılma fiyatı eski seviyeden bu orandan fazla uzaklaşmışsa
-# bot hareketi kovalamaz
-MOMENTUM_MAX_EXTENSION_PCT = 0.015
+# bot hareketi kovalamaz. 0.015 -> 0.008: uzamış kırılımların
+# tepesinden girmeyi engeller (spike kovalamayı azaltır).
+MOMENTUM_MAX_EXTENSION_PCT = 0.008
 
 
 # ============================================================
@@ -657,11 +672,13 @@ def analyze_signal(dataframe):
 
     previous_candle = dataframe.iloc[-3]
     current_candle = dataframe.iloc[-2]
+    trend_ref_candle = dataframe.iloc[-7]  # ~5 mum önceki EMA50
 
     required_values = [
         previous_candle["close"],
         current_candle["close"],
         current_candle["ema_50"],
+        trend_ref_candle["ema_50"],
         previous_candle["macd"],
         previous_candle["macd_signal"],
         current_candle["macd"],
@@ -674,16 +691,37 @@ def analyze_signal(dataframe):
     if any(pd.isna(value) for value in required_values):
         return None
 
-    volume_is_strong = (
+    close_price = safe_float(current_candle["close"])
+    ema_50 = safe_float(current_candle["ema_50"])
+    ema_50_ref = safe_float(trend_ref_candle["ema_50"])
+    rsi_value = safe_float(current_candle["rsi"])
+
+    if ema_50 <= 0 or close_price <= 0:
+        return None
+
+    # YENİDEN TASARIM: Eski sürüm hacim patlamasında (spike) aşırı
+    # alım/satım bölgesinden giriyor, tepeden alıp anında geri
+    # dönüşe yakalanıyordu (kapanan işlemlerde "maks. olumlu
+    # hareket %0" bunun kanıtıydı). Yeni mantık:
+    #   1) EMA50 eğimiyle trend rejimini doğrula (trende karşı girme)
+    #   2) RSI'ı aşırı bölgeden uzak tut (tepeden alma / dipten satma yok)
+    #   3) Fiyat EMA50'den %2'den fazla uzaksa girme (kovalama yok)
+    #   4) Hacim "patlama" değil, ortalama üstü (sağlıklı) olsun
+
+    # Hacim: patlama değil, sağlıklı/ortalama üstü hacim
+    volume_is_healthy = (
         current_candle["volume"]
         >= current_candle["volume_ma"] * VOLUME_SPIKE_FACTOR
     )
 
-    # Sinyaller gevşetildi: RSI bantları genişletildi ve MACD
-    # koşulu (yeni kesişim VEYA süregelen momentum) daha esnek
-    # hale getirildi. Böylece daha fazla nitelikli işlem üretilir;
-    # kârlılık filtrelerini (hacim, komisyon, min pozisyon)
-    # execute_trade katmanı korur.
+    # Trend rejimi: EMA50 eğimi
+    ema_rising = ema_50 > ema_50_ref
+    ema_falling = ema_50 < ema_50_ref
+
+    # Fiyatın EMA50'den uzaklığı (kovalamayı önlemek için)
+    distance_from_ema = abs(close_price - ema_50) / ema_50
+    not_overextended = distance_from_ema <= 0.02  # %2
+
     macd_bullish = (
         current_candle["macd"] > current_candle["macd_signal"]
         and (
@@ -700,21 +738,27 @@ def analyze_signal(dataframe):
         )
     )
 
+    # LONG: yükselen trendde, aşırı alımda değilken, kovalamadan
     long_signal = (
-        current_candle["close"] > current_candle["ema_50"]
+        close_price > ema_50
+        and ema_rising
         and macd_bullish
-        and 35 <= current_candle["rsi"] <= 72
-        and volume_is_strong
+        and 45 <= rsi_value <= 68
+        and not_overextended
+        and volume_is_healthy
     )
 
     if long_signal:
         return "LONG"
 
+    # SHORT: düşen trendde, aşırı satımda değilken, kovalamadan
     short_signal = (
-        current_candle["close"] < current_candle["ema_50"]
+        close_price < ema_50
+        and ema_falling
         and macd_bearish
-        and 28 <= current_candle["rsi"] <= 65
-        and volume_is_strong
+        and 32 <= rsi_value <= 55
+        and not_overextended
+        and volume_is_healthy
     )
 
     if short_signal:
@@ -744,11 +788,9 @@ def analyze_momentum_signal(dataframe_1m, dataframe_3m):
 
     trend_data = calculate_indicators(dataframe_3m)
 
-    momentum_data = dataframe_1m.copy()
-
-    momentum_data["volume_ma"] = (
-        momentum_data["volume"].rolling(20).mean()
-    )
+    # calculate_indicators hem rsi hem volume_ma üretir; böylece
+    # momentum girişinde RSI ile aşırı bölge filtresi uygulanır.
+    momentum_data = calculate_indicators(dataframe_1m)
 
     trend_candle = trend_data.iloc[-2]
     current_candle = momentum_data.iloc[-2]
@@ -768,6 +810,7 @@ def analyze_momentum_signal(dataframe_1m, dataframe_3m):
         current_candle["low"],
         current_candle["volume"],
         current_candle["volume_ma"],
+        current_candle["rsi"],
     ]
 
     if any(pd.isna(value) for value in required_values):
@@ -783,6 +826,7 @@ def analyze_momentum_signal(dataframe_1m, dataframe_3m):
     current_close = safe_float(current_candle["close"])
     current_volume = safe_float(current_candle["volume"])
     volume_average = safe_float(current_candle["volume_ma"])
+    current_rsi = safe_float(current_candle["rsi"])
 
     if (
         previous_high <= 0
@@ -832,10 +876,15 @@ def analyze_momentum_signal(dataframe_1m, dataframe_3m):
         if extension_pct > MOMENTUM_MAX_EXTENSION_PCT:
             short_breakout = False
 
-    if long_trend and long_breakout and volume_is_strong:
+    # RSI aşırı bölge filtresi: kırılım zaten aşırı alım/satıma
+    # ulaşmışsa girme (tepeden alma / dipten satma engellenir).
+    rsi_ok_for_long = current_rsi <= 72
+    rsi_ok_for_short = current_rsi >= 28
+
+    if long_trend and long_breakout and volume_is_strong and rsi_ok_for_long:
         return "LONG"
 
-    if short_trend and short_breakout and volume_is_strong:
+    if short_trend and short_breakout and volume_is_strong and rsi_ok_for_short:
         return "SHORT"
 
     return None
@@ -1045,10 +1094,10 @@ def compute_risk_parameters(side, price, atr_value, current_balance):
       3. Long / short'a göre stop_loss ve take_profit belirlenir.
          take_profit mesafesi = stop mesafesi × RISK_REWARD_RATIO
       4. Pozisyon büyüklüğü, hesabın yalnızca
-         RISK_PER_TRADE_PCT (%0.5) kadarı riske girecek şekilde
+         RISK_PER_TRADE_PCT (%1.0) kadarı riske girecek şekilde
          hesaplanır: trade_amount = risk_tutarı / stop_mesafesi_yüzdesi
-      5. Pozisyon büyüklüğü %10 allocation sınırını (TRADE_SIZE_PERCENT)
-         aşamaz.
+      5. Pozisyon büyüklüğü MAX_ALLOCATION_PCT (%10) allocation
+         sınırını (TRADE_SIZE_PERCENT) aşamaz.
 
     Geçersiz girdi durumunda None döner.
     """
@@ -1079,7 +1128,7 @@ def compute_risk_parameters(side, price, atr_value, current_balance):
         stop_loss = price + stop_distance
         take_profit = price - take_profit_distance
 
-    # 4) Sadece hesabın %0.5'i riske girecek şekilde büyüklük
+    # 4) Sadece hesabın %1.0'i riske girecek şekilde büyüklük
     risk_amount = current_balance * RISK_PER_TRADE_PCT
     trade_amount = risk_amount / stop_distance_pct
 
