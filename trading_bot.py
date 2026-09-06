@@ -73,6 +73,24 @@ RISK_PER_TRADE_PCT = 0.010
 # ATR hesaplama periyodu (tamamlanmış mumlar üzerinde)
 ATR_PERIOD = 14
 
+# --- PİYASA REJİMİ FİLTRESİ (ADX) ---
+# Araştırma bulgusu: trend/breakout stratejileri range (yatay)
+# piyasada başarısız olur; "girer girmez ters dönen" (maks olumlu
+# %0) kayıpların ana sebebi budur. ADX trendin GÜCÜNÜ ölçer.
+ADX_PERIOD = 14
+# ADX bu değerin altındaysa piyasa range/kararsız kabul edilir ve
+# HİÇBİR giriş yapılmaz (ne NORMAL ne MOMENTUM). 25 klasik trend
+# eşiği; 22 biraz daha fazla fırsat bırakır ama gürültüyü eler.
+ADX_MIN_TREND_STRENGTH = 22
+
+# --- ÇOKLU ZAMAN DİLİMİ (MTF) TREND TEYİDİ ---
+# Araştırma bulgusu: üst zaman dilimi trendine KARŞI girmek en sık
+# yapılan hatadır. Aday bir sinyal üretildiğinde 15 dakikalık
+# trendle teyit edilir; çelişirse işlem atlanır. Ekstra API çağrısı
+# sadece aday sinyal varken yapılır (verimli).
+MTF_TREND_ENABLED = True
+MTF_GRANULARITY_SECONDS = 900  # 15 dakika
+
 # Stop mesafesi = ATR × ATR_STOP_MULTIPLIER. 2.0 -> 2.5:
 # stop'a normal piyasa gürültüsünün değmemesi için genişletildi
 # (önceki dar stoplar giriş sonrası salınımda hemen vuruluyordu).
@@ -166,6 +184,7 @@ stats = {
     "volume_rejected": 0,          # Düşük hacim nedeniyle reddedilen
     "commission_rejected": 0,      # Komisyon kârlılığı nedeniyle reddedilen
     "min_position_rejected": 0,    # Minimum pozisyon altı reddedilen
+    "mtf_rejected": 0,             # 15dk trend çelişkisiyle reddedilen
     "position_size_sum": 0.0,      # Açılan pozisyon büyüklükleri toplamı
     "position_size_count": 0,      # Açılan pozisyon sayısı
     "position_size_min": None,     # En küçük açılan pozisyon (USDT)
@@ -571,6 +590,92 @@ def get_klines_data(symbol, resample_minutes=3):
         return None
 
 
+def get_higher_tf_trend(symbol):
+    """
+    15 dakikalık (üst zaman dilimi) trend yönünü döndürür.
+
+    Coinbase'den doğrudan MTF_GRANULARITY_SECONDS (900sn = 15dk)
+    granülaritesinde mum çeker (yeniden örnekleme gerekmez; tek
+    çağrıda EMA50 için yeterli geçmiş gelir).
+
+    Döner:
+      "LONG"  -> üst dilim yükseliyor (fiyat EMA50 üstünde ve EMA50 eğimi yukarı)
+      "SHORT" -> üst dilim düşüyor
+      None    -> belirsiz / veri yetersiz (teyit atlanır, engellemez)
+    """
+    url = f"{MARKET_DATA_BASE_URL}/products/{symbol}/candles"
+    params = {"granularity": MTF_GRANULARITY_SECONDS}
+
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
+        if not isinstance(data, list) or len(data) < 55:
+            return None
+
+        rows = []
+        for candle in data:
+            if not isinstance(candle, list) or len(candle) < 6:
+                continue
+            rows.append(
+                {
+                    "timestamp": safe_float(candle[0]),
+                    "close": safe_float(candle[4]),
+                }
+            )
+
+        if len(rows) < 55:
+            return None
+
+        frame = pd.DataFrame(rows).sort_values("timestamp")
+        frame = frame.drop_duplicates(subset=["timestamp"])
+
+        close = frame["close"]
+        ema_50 = close.ewm(span=50, adjust=False).mean()
+
+        # Tamamlanmış mum (iloc[-2]); iloc[-1] açık mum.
+        current_close = safe_float(close.iloc[-2])
+        current_ema = safe_float(ema_50.iloc[-2])
+        ref_ema = safe_float(ema_50.iloc[-5])  # ~3 mum önceki eğim referansı
+
+        if current_close <= 0 or current_ema <= 0:
+            return None
+
+        if current_close > current_ema and current_ema >= ref_ema:
+            return "LONG"
+
+        if current_close < current_ema and current_ema <= ref_ema:
+            return "SHORT"
+
+        return None
+
+    except requests.exceptions.RequestException:
+        return None
+    except Exception:
+        return None
+
+
+def confirm_with_higher_tf(symbol, signal):
+    """
+    Aday sinyali 15 dakikalık trendle teyit eder.
+
+    - MTF kapalıysa daima True (teyit devre dışı).
+    - Üst dilim yönü belirlenemezse True (engelleme yok; sadece
+      açık çelişkide bloklar).
+    - Üst dilim sinyalle AYNI yöndeyse True, TERS yöndeyse False.
+    """
+    if not MTF_TREND_ENABLED:
+        return True
+
+    higher_trend = get_higher_tf_trend(symbol)
+
+    if higher_trend is None:
+        return True
+
+    return higher_trend == signal
+
+
 
 # ============================================================
 # TEKNİK İNDİKATÖRLER
@@ -673,6 +778,61 @@ def calculate_indicators(dataframe):
 
     dataframe["volume_ma"] = dataframe["volume"].rolling(20).mean()
 
+    # --- ADX (+DI / -DI) : trend GÜCÜ (yön değil) ---
+    # Wilder yöntemi. Piyasa rejimi filtresi olarak kullanılır:
+    # ADX düşükse (range/sıkışma) trend/breakout işlemleri açılmaz.
+    high = dataframe["high"]
+    low = dataframe["low"]
+    prev_close = close.shift(1)
+    prev_high = high.shift(1)
+    prev_low = low.shift(1)
+
+    tr_components = pd.concat(
+        [
+            (high - low),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    up_move = high - prev_high
+    down_move = prev_low - low
+
+    plus_dm = pd.Series(
+        ((up_move > down_move) & (up_move > 0)) * up_move.clip(lower=0),
+        index=dataframe.index,
+    )
+    minus_dm = pd.Series(
+        ((down_move > up_move) & (down_move > 0)) * down_move.clip(lower=0),
+        index=dataframe.index,
+    )
+
+    alpha_adx = 1.0 / ADX_PERIOD
+
+    tr_smooth = tr_components.ewm(
+        alpha=alpha_adx, adjust=False, min_periods=ADX_PERIOD
+    ).mean()
+    plus_dm_smooth = plus_dm.ewm(
+        alpha=alpha_adx, adjust=False, min_periods=ADX_PERIOD
+    ).mean()
+    minus_dm_smooth = minus_dm.ewm(
+        alpha=alpha_adx, adjust=False, min_periods=ADX_PERIOD
+    ).mean()
+
+    plus_di = 100 * (plus_dm_smooth / (tr_smooth + 1e-9))
+    minus_di = 100 * (minus_dm_smooth / (tr_smooth + 1e-9))
+
+    dx = 100 * (
+        (plus_di - minus_di).abs() / ((plus_di + minus_di) + 1e-9)
+    )
+
+    dataframe["plus_di"] = plus_di
+    dataframe["minus_di"] = minus_di
+    dataframe["adx"] = dx.ewm(
+        alpha=alpha_adx, adjust=False, min_periods=ADX_PERIOD
+    ).mean()
+
     return dataframe
 
 
@@ -706,6 +866,7 @@ def analyze_signal(dataframe):
         current_candle["rsi"],
         current_candle["volume"],
         current_candle["volume_ma"],
+        current_candle["adx"],
     ]
 
     if any(pd.isna(value) for value in required_values):
@@ -716,6 +877,12 @@ def analyze_signal(dataframe):
     ema_50 = safe_float(current_candle["ema_50"])
     ema_50_ref = safe_float(trend_ref_candle["ema_50"])
     rsi_value = safe_float(current_candle["rsi"])
+    adx_value = safe_float(current_candle["adx"])
+
+    # REJİM KAPISI: trend yeterince güçlü değilse (range piyasa)
+    # hiç giriş yapma. Trend/breakout stratejileri burada zarar eder.
+    if adx_value < ADX_MIN_TREND_STRENGTH:
+        return None
 
     if ema_50 <= 0 or close_price <= 0:
         return None
@@ -835,6 +1002,7 @@ def analyze_momentum_signal(dataframe_1m, dataframe_3m):
         trend_candle["ema_50"],
         trend_candle["macd"],
         trend_candle["macd_signal"],
+        trend_candle["adx"],
         current_candle["open"],
         current_candle["close"],
         current_candle["high"],
@@ -845,6 +1013,12 @@ def analyze_momentum_signal(dataframe_1m, dataframe_3m):
     ]
 
     if any(pd.isna(value) for value in required_values):
+        return None
+
+    # REJİM KAPISI: 3 dakikalık trend gücü (ADX) yetersizse
+    # (range piyasa) momentum kırılımı da açılmaz. Breakout
+    # stratejileri range piyasada en çok yalancı sinyali üretir.
+    if safe_float(trend_candle["adx"]) < ADX_MIN_TREND_STRENGTH:
         return None
 
     if previous_candles.empty:
@@ -2175,6 +2349,20 @@ DASHBOARD_HTML = """
                 ${{ min_position_size }} altı işlemler engellendi
             </div>
         </div>
+
+        <div class="summary-item">
+            <span class="summary-label">
+                15dk trend reddi
+            </span>
+
+            <span class="summary-value">
+                {{ stats['mtf_rejected'] }}
+            </span>
+
+            <div class="small">
+                Üst zaman dilimi (15dk) trendine ters sinyaller engellendi
+            </div>
+        </div>
     </section>
 
     <h2>Açık Pozisyonlar</h2>
@@ -2432,6 +2620,7 @@ def build_stats_snapshot():
         "volume_rejected": stats["volume_rejected"],
         "commission_rejected": stats["commission_rejected"],
         "min_position_rejected": stats["min_position_rejected"],
+        "mtf_rejected": stats["mtf_rejected"],
         "position_count": count,
         "position_size_avg": round(avg_position, 2),
         "position_size_min": (
@@ -2480,6 +2669,9 @@ def dashboard():
             min_position_size=MIN_POSITION_SIZE,
             max_allocation_pct=(MAX_ALLOCATION_PCT * 100),
             min_24h_volume=MIN_24H_VOLUME,
+            adx_min_trend_strength=ADX_MIN_TREND_STRENGTH,
+            adx_period=ADX_PERIOD,
+            mtf_trend_enabled=MTF_TREND_ENABLED,
             stats=stats_snapshot,
             current_time=utc_time_string(),
             positions=dict(open_positions),
@@ -2527,6 +2719,10 @@ def api_status():
                     "max_allocation_pct": MAX_ALLOCATION_PCT,
                     "min_24h_volume": MIN_24H_VOLUME,
                     "total_commission_rate": TOTAL_COMMISSION_RATE,
+                    "adx_period": ADX_PERIOD,
+                    "adx_min_trend_strength": ADX_MIN_TREND_STRENGTH,
+                    "mtf_trend_enabled": MTF_TREND_ENABLED,
+                    "mtf_granularity_seconds": MTF_GRANULARITY_SECONDS,
                 },
                 "server_time": utc_time_string(),
             }
@@ -2580,6 +2776,18 @@ def run_bot():
     print(
         f"  Maks stop mesafesi : "
         f"%{MAX_STOP_DISTANCE_PCT * 100:.3f}"
+    )
+    print("-" * 60)
+    print("PİYASA REJİMİ FİLTRELERİ")
+    print(f"  ADX periyodu       : {ADX_PERIOD}")
+    print(
+        f"  ADX min trend gücü : {ADX_MIN_TREND_STRENGTH} "
+        f"(altında range kabul edilir, işlem açılmaz)"
+    )
+    print(
+        f"  15dk MTF teyidi    : "
+        f"{'AÇIK' if MTF_TREND_ENABLED else 'KAPALI'} "
+        f"({MTF_GRANULARITY_SECONDS // 60}dk trendine ters sinyaller reddedilir)"
     )
     print("-" * 60)
     print(
@@ -2666,6 +2874,18 @@ def run_bot():
                             signal_dataframe = dataframe_1m
 
                     if signal is None:
+                        continue
+
+                    # ÇOKLU ZAMAN DİLİMİ TEYİDİ: aday sinyal 15dk
+                    # trendiyle çelişiyorsa işlemi atla (trende karşı
+                    # girme). Ekstra API çağrısı sadece burada, aday
+                    # sinyal varken yapılır.
+                    if not confirm_with_higher_tf(symbol, signal):
+                        stats["mtf_rejected"] += 1
+                        print(
+                            f"[❌ MTF] {symbol} {signal} reddedildi: "
+                            f"15dk trendiyle çelişiyor"
+                        )
                         continue
 
                     # Sadece tamamlanmış mumla giriş yapılır.
